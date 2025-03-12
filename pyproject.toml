@@ -1,0 +1,30 @@
+[project]
+name = "autoprox"
+version = "0.1.0"
+description = "simple autonomi proxy server written in python"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "autonomi-client>=0.3.61",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.1",
+    "pydantic>=2.6.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.2.0",
+    "mypy>=1.9.0",
+    "ruff>=0.3.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+autoprox = "autoprox.run:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
