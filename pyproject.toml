@@ -1,6 +1,6 @@
 [project]
 name = "autoprox"
-version = "0.1.0"
+version = "0.1.1"
 description = "simple autonomi proxy server written in python"
 readme = "README.md"
 license = {text = "MIT"}
