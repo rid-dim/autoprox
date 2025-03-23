@@ -56,6 +56,14 @@ async def stream_data(data: bytes, chunk_size: int = 8192) -> AsyncGenerator[byt
         # Small delay to prevent overwhelming the connection
         await asyncio.sleep(0.001)
 
+@app.get("/ant-proxy-id")
+async def get_proxy_id():
+    """
+    Returns the ID of this proxy server instance.
+    This route is globally available (not under version prefixes).
+    """
+    return "autoprox-0"
+
 @app.get("/v0/data/get/public/{data_address}/{filename}")
 async def get_public_data(
     data_address: Annotated[

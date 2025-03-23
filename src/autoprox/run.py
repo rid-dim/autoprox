@@ -19,7 +19,7 @@ def main(args: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--host", 
         type=str,
-        default="localhost", 
+        default="127.0.0.1", 
         help="Host to bind the server to (default: localhost)"
     )
     parser.add_argument(
