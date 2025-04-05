@@ -22,6 +22,14 @@ def create_app() -> FastAPI:
         lifespan=lifespan
     )
 
+    @app.get("/ant-proxy-id")
+    async def get_proxy_id() -> str:
+        """
+        Returns the ID of this proxy server instance.
+        This route is globally available (not under version prefixes).
+        """
+        return "autoprox-0"
+
     # Include all routers
     app.include_router(data.router)
     app.include_router(auth.router)
@@ -43,7 +51,7 @@ def main(args: Optional[List[str]] = None) -> int:
         Exit code (0 for success)
     """
     parser = argparse.ArgumentParser(description="Run the Autonomi Network Proxy server")
-    parser.add_argument("--host", type=str, default="localhost", help="Host to listen on")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to listen on")
     parser.add_argument("--port", type=int, default=17017, help="Port to listen on")
     
     parsed_args = parser.parse_args(args)
