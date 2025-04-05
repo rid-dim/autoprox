@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from .routes import data, auth, health
+from .routes import data, auth, health, websocket
 from .utils.client import lifespan
 import uvicorn
 import argparse
@@ -34,6 +34,7 @@ def create_app() -> FastAPI:
     app.include_router(data.router)
     app.include_router(auth.router)
     app.include_router(health.router)
+    app.include_router(websocket.router)
     
     return app
 
@@ -58,6 +59,7 @@ def main(args: Optional[List[str]] = None) -> int:
     
     print(f"Starting Autonomi Network Proxy on {parsed_args.host}:{parsed_args.port}")
     print(f"API documentation will be available at: http://{parsed_args.host}:{parsed_args.port}/v0/docs")
+    print(f"WebSocket endpoint will be available at: ws://{parsed_args.host}:{parsed_args.port}/v0/ws/proxy")
     
     uvicorn.run(
         "autoprox.main:app",
