@@ -3,6 +3,7 @@ import json
 import secrets
 import string
 import base64
+import hashlib
 from typing import Tuple
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
@@ -28,6 +29,18 @@ def generate_token(length: int = 20) -> str:
     """
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+def hash_token(token: str) -> str:
+    """
+    Create a SHA-256 hash of the token to use as the storage key.
+    
+    Args:
+        token: The original token
+        
+    Returns:
+        Hexadecimal digest of the hashed token
+    """
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
 def encrypt_private_key(private_key: str, token: str) -> str:
     """
@@ -111,8 +124,11 @@ def save_encrypted_key(token: str, encrypted_key: str, wallet_address: str):
         except:
             data = {}
     
-    # Store token -> encrypted key mapping
-    data[token] = {
+    # Use token hash instead of raw token as the key
+    token_hash = hash_token(token)
+    
+    # Store token_hash -> encrypted key mapping
+    data[token_hash] = {
         "encrypted_key": encrypted_key,
         "wallet_address": wallet_address
     }
@@ -145,13 +161,16 @@ def get_encrypted_key(token: str) -> Tuple[str, str]:
             detail="Failed to read keys file"
         )
     
-    if token not in data:
+    # Use token hash instead of raw token as the key
+    token_hash = hash_token(token)
+    
+    if token_hash not in data:
         raise HTTPException(
             status_code=401,
             detail="Invalid token"
         )
     
-    return data[token]["encrypted_key"], data[token]["wallet_address"]
+    return data[token_hash]["encrypted_key"], data[token_hash]["wallet_address"]
 
 def get_wallet_from_token(token: str) -> Wallet:
     """

@@ -3,7 +3,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, Query, De
 from pydantic import BaseModel, Field
 import json
 import asyncio
-from ..utils.crypto import get_wallet_from_token
 from ..utils.udp_manager import UDPManager, ConnectionStatus
 
 # Create a router for websocket endpoints
@@ -27,7 +26,6 @@ async def get_websocket_info():
     return {
         "websocket_url": "/v0/ws/proxy",
         "parameters": {
-            "token": "Auth token (required)",
             "remote_host": "Target IP address (required)",
             "remote_port": "Target port (required)",
             "encryption_key": "Encryption key (required)"
@@ -35,32 +33,12 @@ async def get_websocket_info():
         "documentation": "See README-websocket-udp.md for details"
     }
 
-async def get_token(
-    websocket: WebSocket,
-    token: Optional[str] = Query(None, alias="token")
-) -> str:
-    """
-    Get the authentication token from query parameters
-    """
-    if token is None:
-        await websocket.close(code=1008, reason="Missing authentication token")
-        return None
-    
-    try:
-        # Validate token by trying to get the wallet
-        wallet = get_wallet_from_token(token)
-        return token
-    except Exception as e:
-        await websocket.close(code=1008, reason=f"Invalid authentication token: {str(e)}")
-        return None
-
 @router.websocket("/ws/proxy")
 async def websocket_proxy(
     websocket: WebSocket,
     remote_host: str = Query(..., description="Remote host IP address"),
     remote_port: int = Query(..., description="Remote host port"),
-    encryption_key: str = Query(..., description="Encryption key for UDP communication"),
-    token: str = Depends(get_token)
+    encryption_key: str = Query(..., description="Encryption key for UDP communication")
 ):
     """
     WebSocket endpoint that acts as a proxy to a UDP hole-punching connection.
@@ -71,10 +49,6 @@ async def websocket_proxy(
     The UDP connection uses hole-punching to establish a connection through NATs.
     All UDP data is encrypted using the provided encryption key.
     """
-    if token is None:
-        # Connection already closed in get_token
-        return
-    
     await websocket.accept()
     
     # Create UDP manager for this connection
@@ -85,7 +59,7 @@ async def websocket_proxy(
     )
     
     # Store the connection
-    connection_id = f"{token}_{remote_host}_{remote_port}"
+    connection_id = f"{remote_host}_{remote_port}"
     active_connections[connection_id] = udp_manager
     
     try:
