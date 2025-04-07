@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field
 import json
 import asyncio
 from ..utils.udp_manager import UDPManager, ConnectionStatus
+import os
+from ..utils.network import get_public_connection_info
 
 # Create a router for websocket endpoints
 router = APIRouter(prefix="/v0", tags=["websocket"])
@@ -15,6 +17,7 @@ class WebSocketInfo(BaseModel):
     """Model for WebSocket information response"""
     websocket_url: str = Field(..., description="URL of the WebSocket endpoint")
     parameters: Dict[str, str] = Field(..., description="Required parameters for the WebSocket connection")
+    udp_connection_info: str = Field(..., description="UDP connection information")
     documentation: str = Field(..., description="Reference to detailed documentation")
 
 @router.get("/ws/info", response_model=WebSocketInfo)
@@ -23,6 +26,13 @@ async def get_websocket_info():
     Returns information about the WebSocket-UDP proxy endpoint.
     This is a helper endpoint since WebSockets cannot be documented in Swagger.
     """
+    
+    # Ermittle die öffentliche IP per get_public_connection_info
+    connection_info = await get_public_connection_info()
+    
+    # Erstelle die UDP-Verbindungs-URL
+    udp_connection_url = f"udp://{connection_info['public_ip']}:{connection_info['port']}"
+    
     return {
         "websocket_url": "/v0/ws/proxy",
         "parameters": {
@@ -30,6 +40,7 @@ async def get_websocket_info():
             "remote_port": "Target port (required)",
             "encryption_key": "Encryption key (required)"
         },
+        "udp_connection_info": udp_connection_url,
         "documentation": "See README-websocket-udp.md for details"
     }
 

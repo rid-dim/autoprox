@@ -7,6 +7,8 @@ from enum import Enum
 from typing import Optional, Tuple, Union, Dict, Any, List
 from ..utils.encryption import encrypt_data, decrypt_data
 from datetime import datetime
+import os
+import aiohttp
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,7 +39,7 @@ class UDPManager:
         remote_host: str, 
         remote_port: int, 
         encryption_key: str,
-        local_port: int = 0  # Use 0 to let the OS assign a port
+        local_port: int = int(os.environ.get('AUTOPROX_UDP_PORT'))  # Use environment variable
     ):
         self.remote_host = remote_host
         self.remote_port = remote_port
@@ -247,3 +249,30 @@ class UDPManager:
             except Exception as e:
                 logger.error(f"Error in connection monitor: {e}")
                 await asyncio.sleep(1)  # Longer sleep on error 
+
+    async def get_public_ip() -> str:
+        """
+        Ermittelt die öffentliche IP-Adresse des Servers.
+        
+        Returns:
+            Öffentliche IP-Adresse als String
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get('https://api.ipify.org') as response:
+                    return await response.text()
+        except Exception as e:
+            logger.error(f"Fehler bei der Ermittlung der öffentlichen IP: {e}")
+            return "unknown"
+
+    def get_public_connection_info(self) -> Dict[str, Union[str, int]]:
+        """
+        Gibt Informationen zur UDP-Verbindung zurück.
+        
+        Returns:
+            Dictionary mit öffentlicher IP und Port
+        """
+        return {
+            "public_ip": asyncio.run(self.get_public_ip()),
+            "port": self.local_port
+        } 
