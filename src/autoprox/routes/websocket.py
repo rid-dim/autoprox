@@ -210,11 +210,17 @@ async def forward_websocket_to_udp(websocket: WebSocket, udp_manager: UDPManager
                 # Handle commands (future extension)
                 pass
                 
+        except WebSocketDisconnect:
+            logger.info("WebSocket disconnected, stopping forward_websocket_to_udp loop.")
+            break
         except json.JSONDecodeError:
             # Falls keine gültige JSON-Nachricht, versuche als Roh-Text zu behandeln
             try:
                 raw_message = await websocket.receive_text()
                 await udp_manager.send(raw_message.encode('utf-8'))
+            except WebSocketDisconnect:
+                logger.info("WebSocket disconnected during raw message handling, stopping loop.")
+                break
             except Exception as e:
                 logger.error(f"Fehler beim Verarbeiten der WebSocket-Nachricht: {e}")
         except Exception as e:
