@@ -32,12 +32,14 @@ HEARTBEAT_INTERVAL = 1.0  # seconds
 HEARTBEAT_TIMEOUT = 5.0  # seconds
 # Maximum UDP packet size (bytes) - safe limit to avoid fragmentation
 MAX_UDP_PACKET_SIZE = 1400  # Conservative estimate for most networks
+# Encrypted data is typically 30-40% larger than raw data due to IV, padding, and encoding
+ENCRYPTION_OVERHEAD_FACTOR = 1.4  # 40% overhead for encryption
 # Fragment message prefix
 FRAGMENT_PREFIX = b"FRAGMENT:"
 # Fragment header size (bytes): 4 (msg_id) + 4 (total_fragments) + 4 (fragment_index) + 4 (payload_size)
 FRAGMENT_HEADER_SIZE = 16
-# Maximum payload size per fragment
-MAX_FRAGMENT_PAYLOAD_SIZE = MAX_UDP_PACKET_SIZE - len(FRAGMENT_PREFIX) - FRAGMENT_HEADER_SIZE
+# Adjusted maximum fragment payload to account for encryption overhead
+MAX_FRAGMENT_PAYLOAD_SIZE = int((MAX_UDP_PACKET_SIZE - len(FRAGMENT_PREFIX) - FRAGMENT_HEADER_SIZE) / ENCRYPTION_OVERHEAD_FACTOR)
 
 class UDPManager:
     """
@@ -152,7 +154,8 @@ class UDPManager:
         if not self._running:
             raise RuntimeError("UDP manager is not running")
         
-        if len(data) <= MAX_UDP_PACKET_SIZE:
+        # Konservativere Schätzung der maximalen Datengröße aufgrund von Verschlüsselungs-Overhead
+        if len(data) <= MAX_FRAGMENT_PAYLOAD_SIZE:
             # Small message, send directly
             await self._send_queue.put(data)
         else:
@@ -299,6 +302,10 @@ class UDPManager:
         """Background task for receiving UDP packets"""
         loop = asyncio.get_event_loop()
         
+        # Puffer für verschlüsselte Notfall-Fragmente
+        encrypted_fragments = {}
+        last_fragment_time = {}
+        
         while self._running:
             try:
                 # Wait for data using asyncio
@@ -310,7 +317,55 @@ class UDPManager:
                     logger.warning(f"Received data from unexpected address: {addr}, expected: {peer_addr}")
                     continue
                 
-                # Decrypt the data
+                # Spezieller Fall: Wenn wir mehrere UDP-Pakete mit fast gleicher Größe erhalten,
+                # könnten das unsere notfall-fragmentierten verschlüsselten Daten sein
+                addr_key = f"{addr[0]}:{addr[1]}"
+                current_time = time.time()
+                
+                # Wenn das Paket etwa die maximale Größe hat, behandle es als potenzielles Fragment
+                if abs(len(data) - (MAX_UDP_PACKET_SIZE - 20)) < 50:
+                    if addr_key not in encrypted_fragments:
+                        encrypted_fragments[addr_key] = []
+                        last_fragment_time[addr_key] = current_time
+                    
+                    # Sammle Fragmente
+                    encrypted_fragments[addr_key].append(data)
+                    last_fragment_time[addr_key] = current_time
+                    
+                    # Wenn eine Pause von mehr als 0.1 Sekunden zwischen Paketen liegt, 
+                    # versuche die gesammelten Fragmente zu verarbeiten
+                    await asyncio.sleep(0.1)
+                    if current_time - last_fragment_time[addr_key] >= 0.1 and encrypted_fragments[addr_key]:
+                        # Versuche die gesammelten Fragmente zusammenzusetzen und zu entschlüsseln
+                        try:
+                            combined_data = b''.join(encrypted_fragments[addr_key])
+                            decrypted_data = decrypt_data(self.encryption_key, combined_data)
+                            
+                            # Leere den Puffer
+                            encrypted_fragments[addr_key] = []
+                            
+                            # Verarbeite die entschlüsselten Daten wie gehabt
+                            if decrypted_data.startswith(HEARTBEAT_PREFIX):
+                                logger.debug("Received heartbeat from remote peer")
+                                self._last_heartbeat_received = time.time()
+                                
+                                if self._status == ConnectionStatus.UDP_WAITING:
+                                    self._status = ConnectionStatus.UDP_ESTABLISHED
+                                    logger.info("UDP connection established with remote peer")
+                            elif decrypted_data.startswith(FRAGMENT_PREFIX):
+                                reassembled = await self._process_fragments(decrypted_data)
+                                if reassembled:
+                                    await self._receive_queue.put(reassembled)
+                            else:
+                                await self._receive_queue.put(decrypted_data)
+                            
+                            continue
+                        except Exception as e:
+                            # Wenn die Entschlüsselung fehlschlägt, verarbeite die Daten einzeln
+                            logger.debug(f"Failed to combine fragments: {e}")
+                            encrypted_fragments[addr_key] = []
+                
+                # Normal processing for individual packets
                 try:
                     decrypted_data = decrypt_data(self.encryption_key, data)
                     
@@ -361,8 +416,20 @@ class UDPManager:
                 
                 # Check size before sending
                 if len(encrypted_data) > MAX_UDP_PACKET_SIZE:
-                    logger.warning(f"Encrypted data too large: {len(encrypted_data)} bytes. This should not happen " +
-                                  "as large messages should be fragmented before encryption.")
+                    logger.warning(f"Encrypted data too large: {len(encrypted_data)} bytes. Fragmenting large encrypted data.")
+                    
+                    # Notfall-Fragmentierung für verschlüsselte Daten, die das Limit überschreiten
+                    # Wir müssen das Fragment-Präfix entfernen, da wir die verschlüsselten Daten direkt fragmentieren
+                    max_chunk_size = MAX_UDP_PACKET_SIZE - 20  # Kleiner Puffer für UDP-Header
+                    
+                    chunks = [encrypted_data[i:i+max_chunk_size] for i in range(0, len(encrypted_data), max_chunk_size)]
+                    logger.info(f"Emergency fragmenting encrypted data into {len(chunks)} chunks")
+                    
+                    for chunk in chunks:
+                        peer_addr = (self.remote_host, self.remote_port)
+                        self._socket.sendto(chunk, peer_addr)
+                        await asyncio.sleep(0.01)  # Kleine Pause zwischen Fragmenten
+                    
                     continue
                 
                 # Send it
