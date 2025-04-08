@@ -4,10 +4,14 @@ from pydantic import BaseModel, Field
 import json
 import asyncio
 import uuid
+import logging
 from ..utils.udp_manager import UDPManager, ConnectionStatus, HEARTBEAT_PREFIX
 import os
 from ..utils.network import get_public_ip
 import base64
+
+# Logging konfigurieren
+logger = logging.getLogger(__name__)
 
 # Create a router for websocket endpoints
 router = APIRouter(prefix="/v0", tags=["websocket"])
