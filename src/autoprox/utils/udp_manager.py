@@ -66,9 +66,8 @@ class UDPManager:
         self._last_heartbeat_received = 0
         self._tasks = []
         
-        # Communication queues - separate queue for heartbeats to prioritize them
-        self._regular_send_queue = asyncio.Queue()
-        self._heartbeat_send_queue = asyncio.Queue()  # New dedicated queue for heartbeats
+        # Communication queues
+        self._send_queue = asyncio.Queue()
         self._receive_queue = asyncio.Queue()
         
         # Determine if IPv6 is being used
@@ -85,9 +84,6 @@ class UDPManager:
         self._fragment_buffer = {}  # Store received fragments: {msg_id: {fragment_index: data, ...}, ...}
         self._completed_messages = {}  # Store completed messages: {msg_id: (completed, total_fragments)}
         self._fragment_cleanup_task = None
-        
-        # Heartbeat tracking
-        self._last_heartbeat_sent = 0
     
     async def start(self):
         """Start the UDP manager and establish connection"""
@@ -161,7 +157,7 @@ class UDPManager:
         # Konservativere Schätzung der maximalen Datengröße aufgrund von Verschlüsselungs-Overhead
         if len(data) <= MAX_FRAGMENT_PAYLOAD_SIZE:
             # Small message, send directly
-            await self._regular_send_queue.put(data)
+            await self._send_queue.put(data)
         else:
             # Large message, needs fragmentation
             await self._send_fragmented(data)
@@ -194,7 +190,7 @@ class UDPManager:
             fragment = FRAGMENT_PREFIX + header + payload
             
             # Send fragment
-            await self._regular_send_queue.put(fragment)
+            await self._send_queue.put(fragment)
             
         logger.debug(f"Fragmented message {msg_id} into {total_fragments} parts")
     
@@ -409,98 +405,61 @@ class UDPManager:
                 await asyncio.sleep(0.1)  # Avoid tight loop on error
     
     async def _udp_send_loop(self):
-        """Background task for sending UDP packets with priority for heartbeats"""
+        """Background task for sending UDP packets"""
         while self._running:
             try:
-                # First check if there are any heartbeats to send (prioritized)
-                # We use try_get to not block if there are no heartbeats
-                heartbeat_data = None
+                # Get data from the send queue
+                data = await self._send_queue.get()
                 
-                try:
-                    # Try to get a heartbeat message first (non-blocking)
-                    heartbeat_data = self._heartbeat_send_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    # No heartbeat message in queue, that's okay
-                    pass
+                # Encrypt the data
+                encrypted_data = encrypt_data(self.encryption_key, data)
                 
-                # If we have a heartbeat, send it immediately
-                if heartbeat_data:
-                    await self._send_packet(heartbeat_data)
-                    self._heartbeat_send_queue.task_done()
+                # Check size before sending
+                if len(encrypted_data) > MAX_UDP_PACKET_SIZE:
+                    logger.warning(f"Encrypted data too large: {len(encrypted_data)} bytes. Fragmenting large encrypted data.")
+                    
+                    # Notfall-Fragmentierung für verschlüsselte Daten, die das Limit überschreiten
+                    # Wir müssen das Fragment-Präfix entfernen, da wir die verschlüsselten Daten direkt fragmentieren
+                    max_chunk_size = MAX_UDP_PACKET_SIZE - 20  # Kleiner Puffer für UDP-Header
+                    
+                    chunks = [encrypted_data[i:i+max_chunk_size] for i in range(0, len(encrypted_data), max_chunk_size)]
+                    logger.info(f"Emergency fragmenting encrypted data into {len(chunks)} chunks")
+                    
+                    # Zeitstempel für den letzten gesendeten Heartbeat während der Notfall-Fragmentierung
+                    last_heartbeat_during_emergency = time.time()
+                    
+                    for i, chunk in enumerate(chunks):
+                        peer_addr = (self.remote_host, self.remote_port)
+                        self._socket.sendto(chunk, peer_addr)
+                        
+                        # Überprüfe, ob ein Heartbeat gesendet werden sollte (alle HEARTBEAT_INTERVAL Sekunden)
+                        current_time = time.time()
+                        if current_time - last_heartbeat_during_emergency >= HEARTBEAT_INTERVAL:
+                            # Generiere und sende einen Heartbeat direkt
+                            random_bytes = secrets.token_bytes(8)
+                            heartbeat_msg = HEARTBEAT_PREFIX + random_bytes
+                            heartbeat_encrypted = encrypt_data(self.encryption_key, heartbeat_msg)
+                            
+                            self._socket.sendto(heartbeat_encrypted, peer_addr)
+                            logger.debug(f"Sent emergency heartbeat during large data transfer (after chunk {i}/{len(chunks)})")
+                            
+                            # Aktualisiere den Zeitstempel
+                            last_heartbeat_during_emergency = current_time
+                        
+                        await asyncio.sleep(0.01)  # Kleine Pause zwischen Fragmenten
+                    
                     continue
                 
-                # Otherwise, try to get a regular message
-                # This will block until a message is available
-                data = await self._regular_send_queue.get()
-                await self._send_packet(data)
-                self._regular_send_queue.task_done()
+                # Send it
+                peer_addr = (self.remote_host, self.remote_port)
+                self._socket.sendto(encrypted_data, peer_addr)
+                logger.debug(f"Sent {len(encrypted_data)} bytes to {peer_addr}")
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in UDP send loop: {e}")
                 await asyncio.sleep(0.1)  # Avoid tight loop on error
-    
-    async def _send_packet(self, data: bytes):
-        """Send a single packet, handling encryption and emergency fragmentation if needed"""
-        try:
-            # Encrypt the data
-            encrypted_data = encrypt_data(self.encryption_key, data)
-            
-            # Check size before sending
-            if len(encrypted_data) > MAX_UDP_PACKET_SIZE:
-                logger.warning(f"Encrypted data too large: {len(encrypted_data)} bytes. Fragmenting large encrypted data.")
-                
-                # Notfall-Fragmentierung für verschlüsselte Daten, die das Limit überschreiten
-                max_chunk_size = MAX_UDP_PACKET_SIZE - 20  # Kleiner Puffer für UDP-Header
-                
-                chunks = [encrypted_data[i:i+max_chunk_size] for i in range(0, len(encrypted_data), max_chunk_size)]
-                logger.info(f"Emergency fragmenting encrypted data into {len(chunks)} chunks")
-                
-                for i, chunk in enumerate(chunks):
-                    peer_addr = (self.remote_host, self.remote_port)
-                    self._socket.sendto(chunk, peer_addr)
-                    
-                    # Every 10 chunks, check if we need to send a heartbeat
-                    if i % 10 == 0 and i > 0:
-                        # Check if it's time for another heartbeat
-                        current_time = time.time()
-                        if current_time - self._last_heartbeat_sent >= HEARTBEAT_INTERVAL:
-                            # Send a heartbeat directly
-                            await self._send_direct_heartbeat()
-                    
-                    # Smaller pause to improve throughput while still allowing other tasks to run
-                    await asyncio.sleep(0.005)  # 5ms pause zwischen Fragmenten
-                
-                return
-            
-            # Send normal packet
-            peer_addr = (self.remote_host, self.remote_port)
-            self._socket.sendto(encrypted_data, peer_addr)
-            logger.debug(f"Sent {len(encrypted_data)} bytes to {peer_addr}")
-            
-        except Exception as e:
-            logger.error(f"Error sending packet: {e}")
-            raise
-    
-    async def _send_direct_heartbeat(self):
-        """Send a heartbeat directly, bypassing the queue system"""
-        try:
-            # Generate a heartbeat with random bytes
-            random_bytes = secrets.token_bytes(8)
-            heartbeat_msg = HEARTBEAT_PREFIX + random_bytes
-            
-            # Encrypt and send directly
-            encrypted_data = encrypt_data(self.encryption_key, heartbeat_msg)
-            peer_addr = (self.remote_host, self.remote_port)
-            self._socket.sendto(encrypted_data, peer_addr)
-            
-            # Update last heartbeat timestamp
-            self._last_heartbeat_sent = time.time()
-            logger.debug(f"Sent direct heartbeat to remote peer")
-            
-        except Exception as e:
-            logger.error(f"Error sending direct heartbeat: {e}")
     
     async def _heartbeat_loop(self):
         """Background task for sending heartbeats to keep the connection alive"""
@@ -513,10 +472,9 @@ class UDPManager:
                 # Erstelle die Heartbeat-Nachricht mit Zufallswert
                 heartbeat_msg = HEARTBEAT_PREFIX + random_bytes
                 
-                # Sende den Heartbeat mit Zufallswert in die priorisierte Heartbeat-Queue
-                await self._heartbeat_send_queue.put(heartbeat_msg)
-                self._last_heartbeat_sent = time.time()
-                logger.debug(f"Queued heartbeat to remote peer (with {len(random_bytes)} random bytes)")
+                # Sende den Heartbeat mit Zufallswert
+                await self._send_queue.put(heartbeat_msg)
+                logger.debug(f"Sent heartbeat to remote peer (with {len(random_bytes)} random bytes)")
                 
                 # Wait for the next heartbeat interval
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
