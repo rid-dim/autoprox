@@ -12,6 +12,8 @@ from ..utils.encryption import encrypt_data, decrypt_data
 from datetime import datetime
 import os
 import aiohttp
+import zmq
+import zmq.asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,10 +43,16 @@ FRAGMENT_HEADER_SIZE = 16
 # Adjusted maximum fragment payload to account for encryption overhead
 MAX_FRAGMENT_PAYLOAD_SIZE = int((MAX_UDP_PACKET_SIZE - len(FRAGMENT_PREFIX) - FRAGMENT_HEADER_SIZE) / ENCRYPTION_OVERHEAD_FACTOR)
 
+# ZeroMQ related constants
+ZMQ_SEND_ADDR = "inproc://udp_send"
+ZMQ_RECV_ADDR = "inproc://udp_recv"
+ZMQ_HWM = 1000  # High water mark (message queue limit)
+
 class UDPManager:
     """
     Manages a UDP connection with hole-punching capabilities.
     Handles encryption of all data and maintains connection status.
+    Uses ZeroMQ for internal communication between WebSocket and UDP threads.
     """
     
     def __init__(
@@ -66,9 +74,10 @@ class UDPManager:
         self._last_heartbeat_received = 0
         self._tasks = []
         
-        # Communication queues
-        self._send_queue = asyncio.Queue()
-        self._receive_queue = asyncio.Queue()
+        # ZeroMQ context and sockets
+        self._zmq_context = zmq.asyncio.Context()
+        self._zmq_send_socket = None
+        self._zmq_recv_socket = None
         
         # Determine if IPv6 is being used
         try:
@@ -115,6 +124,17 @@ class UDPManager:
         logger.info(f"UDP socket bound to {'::'if self.is_ipv6 else '0.0.0.0'}:{self.local_port}")
         logger.info(f"Attempting to connect to remote peer at {self.remote_host}:{self.remote_port}")
         
+        # Set up ZeroMQ sockets
+        # Push socket for sending data from WebSocket to UDP
+        self._zmq_send_socket = self._zmq_context.socket(zmq.PUSH)
+        self._zmq_send_socket.set_hwm(ZMQ_HWM)
+        self._zmq_send_socket.bind(ZMQ_SEND_ADDR)
+        
+        # Pub socket for sending received UDP data to WebSocket
+        self._zmq_recv_socket = self._zmq_context.socket(zmq.PUB)
+        self._zmq_recv_socket.set_hwm(ZMQ_HWM)
+        self._zmq_recv_socket.bind(ZMQ_RECV_ADDR)
+        
         # Start the background tasks
         self._tasks = [
             asyncio.create_task(self._udp_receive_loop()),
@@ -144,27 +164,34 @@ class UDPManager:
             self._socket.close()
             self._socket = None
         
+        # Close ZeroMQ sockets
+        if self._zmq_send_socket:
+            self._zmq_send_socket.close()
+        if self._zmq_recv_socket:
+            self._zmq_recv_socket.close()
+        
         logger.info("UDP manager stopped")
     
     async def send(self, data: bytes):
         """
         Send data to the remote peer.
         Large messages will be automatically fragmented.
+        Uses ZeroMQ to push data to the UDP sender thread.
         """
         if not self._running:
             raise RuntimeError("UDP manager is not running")
         
         # Konservativere Schätzung der maximalen Datengröße aufgrund von Verschlüsselungs-Overhead
         if len(data) <= MAX_FRAGMENT_PAYLOAD_SIZE:
-            # Small message, send directly
-            await self._send_queue.put(data)
+            # Small message, send directly via ZeroMQ
+            await self._zmq_send_socket.send(data)
         else:
             # Large message, needs fragmentation
             await self._send_fragmented(data)
     
     async def _send_fragmented(self, data: bytes):
         """
-        Fragment and send a large message.
+        Fragment and send a large message via ZeroMQ.
         
         Format:
         FRAGMENT_PREFIX + msg_id(4) + total_fragments(4) + fragment_index(4) + payload_size(4) + payload
@@ -175,6 +202,8 @@ class UDPManager:
         
         # Calculate total fragments needed
         total_fragments = (len(data) + MAX_FRAGMENT_PAYLOAD_SIZE - 1) // MAX_FRAGMENT_PAYLOAD_SIZE
+        
+        logger.info(f"Fragmenting message {msg_id} into {total_fragments} parts (total size: {len(data)} bytes)")
         
         # Split data into fragments
         for i in range(total_fragments):
@@ -189,20 +218,52 @@ class UDPManager:
             # Create fragment
             fragment = FRAGMENT_PREFIX + header + payload
             
-            # Send fragment
-            await self._send_queue.put(fragment)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            logger.info(f"{timestamp} - Starting to send fragment {i+1}/{total_fragments} for message {msg_id} with size {payload_size} bytes")
             
-        logger.debug(f"Fragmented message {msg_id} into {total_fragments} parts")
+            # Send fragment via ZeroMQ
+            await self._zmq_send_socket.send(fragment)
+            
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            logger.info(f"{timestamp} - Completed sending fragment {i+1}/{total_fragments} for message {msg_id}")
+            
+        logger.info(f"All fragments for message {msg_id} have been sent to UDP worker")
+    
+    def get_receive_socket(self):
+        """
+        Returns a ZeroMQ SUB socket connected to the receive channel.
+        The caller is responsible for managing this socket.
+        
+        Returns:
+            ZeroMQ SUB socket
+        """
+        sub_socket = self._zmq_context.socket(zmq.SUB)
+        sub_socket.connect(ZMQ_RECV_ADDR)
+        sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
+        return sub_socket
     
     async def receive(self) -> Optional[bytes]:
         """
         Receive data from the remote peer.
         Fragmented messages will be reassembled automatically.
+        
+        Creates a temporary SUB socket to receive one message.
+        For continuous receiving, use get_receive_socket() instead.
         """
         if not self._running:
             return None
         
-        return await self._receive_queue.get()
+        # Create a temporary SUB socket
+        sub_socket = self._zmq_context.socket(zmq.SUB)
+        sub_socket.connect(ZMQ_RECV_ADDR)
+        sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
+        
+        try:
+            # Wait for a message
+            data = await sub_socket.recv()
+            return data
+        finally:
+            sub_socket.close()
     
     def get_status(self) -> ConnectionStatus:
         """Get the current connection status"""
@@ -243,16 +304,22 @@ class UDPManager:
         # Store fragment
         if msg_id not in self._fragment_buffer:
             self._fragment_buffer[msg_id] = {}
+            logger.info(f"Started receiving new fragmented message {msg_id} with {total_fragments} fragments")
         
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        logger.info(f"{timestamp} - Received fragment {fragment_index+1}/{total_fragments} for message {msg_id} with size {payload_size} bytes")
         self._fragment_buffer[msg_id][fragment_index] = payload
         
         # Check if we have all fragments
         if len(self._fragment_buffer[msg_id]) == total_fragments:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            logger.info(f"{timestamp} - All fragments received for message {msg_id}, starting reassembly")
+            
             # Reassemble message
             reassembled = bytearray()
             for i in range(total_fragments):
                 if i not in self._fragment_buffer[msg_id]:
-                    logger.warning(f"Missing fragment {i} for message {msg_id}")
+                    logger.warning(f"Missing fragment {i+1} for message {msg_id}")
                     return None
                 reassembled.extend(self._fragment_buffer[msg_id][i])
             
@@ -262,7 +329,8 @@ class UDPManager:
             # Clean up fragments
             del self._fragment_buffer[msg_id]
             
-            logger.debug(f"Reassembled message {msg_id} from {total_fragments} fragments")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            logger.info(f"{timestamp} - Successfully reassembled message {msg_id} from {total_fragments} fragments, total size: {len(reassembled)} bytes")
             return bytes(reassembled)
         
         return None
@@ -299,7 +367,7 @@ class UDPManager:
                 await asyncio.sleep(10)
     
     async def _udp_receive_loop(self):
-        """Background task for receiving UDP packets"""
+        """Background task for receiving UDP packets and publishing them to ZeroMQ"""
         loop = asyncio.get_event_loop()
         
         # Puffer für verschlüsselte Notfall-Fragmente
@@ -327,8 +395,12 @@ class UDPManager:
                     if addr_key not in encrypted_fragments:
                         encrypted_fragments[addr_key] = []
                         last_fragment_time[addr_key] = current_time
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        logger.info(f"{timestamp} - Started receiving emergency encrypted fragments from {addr_key}")
                     
                     # Sammle Fragmente
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    logger.info(f"{timestamp} - Received emergency encrypted fragment #{len(encrypted_fragments[addr_key])+1} with size {len(data)} bytes from {addr_key}")
                     encrypted_fragments[addr_key].append(data)
                     last_fragment_time[addr_key] = current_time
                     
@@ -339,10 +411,16 @@ class UDPManager:
                         # Versuche die gesammelten Fragmente zusammenzusetzen und zu entschlüsseln
                         try:
                             combined_data = b''.join(encrypted_fragments[addr_key])
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                            logger.info(f"{timestamp} - Attempting to reassemble and decrypt {len(encrypted_fragments[addr_key])} emergency fragments with total size {len(combined_data)} bytes")
+                            
                             decrypted_data = decrypt_data(self.encryption_key, combined_data)
                             
                             # Leere den Puffer
                             encrypted_fragments[addr_key] = []
+                            
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                            logger.info(f"{timestamp} - Successfully decrypted emergency fragments, resulting in {len(decrypted_data)} bytes of data")
                             
                             # Verarbeite die entschlüsselten Daten wie gehabt
                             if decrypted_data.startswith(HEARTBEAT_PREFIX):
@@ -355,14 +433,17 @@ class UDPManager:
                             elif decrypted_data.startswith(FRAGMENT_PREFIX):
                                 reassembled = await self._process_fragments(decrypted_data)
                                 if reassembled:
-                                    await self._receive_queue.put(reassembled)
+                                    # Publish reassembled message to ZeroMQ
+                                    await self._zmq_recv_socket.send(reassembled)
                             else:
-                                await self._receive_queue.put(decrypted_data)
+                                # Publish message to ZeroMQ
+                                await self._zmq_recv_socket.send(decrypted_data)
                             
                             continue
                         except Exception as e:
                             # Wenn die Entschlüsselung fehlschlägt, verarbeite die Daten einzeln
-                            logger.debug(f"Failed to combine fragments: {e}")
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                            logger.warning(f"{timestamp} - Failed to combine encrypted fragments: {e}")
                             encrypted_fragments[addr_key] = []
                 
                 # Normal processing for individual packets
@@ -384,12 +465,12 @@ class UDPManager:
                         # Process fragment
                         reassembled = await self._process_fragments(decrypted_data)
                         if reassembled:
-                            # Have a complete message, put it in the receive queue
-                            await self._receive_queue.put(reassembled)
+                            # Publish reassembled message to ZeroMQ
+                            await self._zmq_recv_socket.send(reassembled)
                     
                     else:
-                        # Regular data, put in receive queue
-                        await self._receive_queue.put(decrypted_data)
+                        # Regular data, publish to ZeroMQ
+                        await self._zmq_recv_socket.send(decrypted_data)
                         
                 except Exception as e:
                     logger.error(f"Error decrypting received data: {e}")
@@ -405,11 +486,15 @@ class UDPManager:
                 await asyncio.sleep(0.1)  # Avoid tight loop on error
     
     async def _udp_send_loop(self):
-        """Background task for sending UDP packets"""
+        """Background task for sending UDP packets from ZeroMQ to UDP"""
+        # Create a PULL socket to receive data from the send queue
+        pull_socket = self._zmq_context.socket(zmq.PULL)
+        pull_socket.connect(ZMQ_SEND_ADDR)
+        
         while self._running:
             try:
-                # Get data from the send queue
-                data = await self._send_queue.get()
+                # Get data from the ZeroMQ socket
+                data = await pull_socket.recv()
                 
                 # Encrypt the data
                 encrypted_data = encrypt_data(self.encryption_key, data)
@@ -429,8 +514,14 @@ class UDPManager:
                     last_heartbeat_during_emergency = time.time()
                     
                     for i, chunk in enumerate(chunks):
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        logger.info(f"{timestamp} - Starting to send emergency chunk {i+1}/{len(chunks)} with size {len(chunk)} bytes")
+                        
                         peer_addr = (self.remote_host, self.remote_port)
                         self._socket.sendto(chunk, peer_addr)
+                        
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        logger.info(f"{timestamp} - Completed sending emergency chunk {i+1}/{len(chunks)}")
                         
                         # Überprüfe, ob ein Heartbeat gesendet werden sollte (alle HEARTBEAT_INTERVAL Sekunden)
                         current_time = time.time()
@@ -441,7 +532,7 @@ class UDPManager:
                             heartbeat_encrypted = encrypt_data(self.encryption_key, heartbeat_msg)
                             
                             self._socket.sendto(heartbeat_encrypted, peer_addr)
-                            logger.debug(f"Sent emergency heartbeat during large data transfer (after chunk {i}/{len(chunks)})")
+                            logger.debug(f"Sent emergency heartbeat during large data transfer (after chunk {i+1}/{len(chunks)})")
                             
                             # Aktualisiere den Zeitstempel
                             last_heartbeat_during_emergency = current_time
@@ -460,6 +551,9 @@ class UDPManager:
             except Exception as e:
                 logger.error(f"Error in UDP send loop: {e}")
                 await asyncio.sleep(0.1)  # Avoid tight loop on error
+        
+        # Clean up
+        pull_socket.close()
     
     async def _heartbeat_loop(self):
         """Background task for sending heartbeats to keep the connection alive"""
@@ -472,8 +566,8 @@ class UDPManager:
                 # Erstelle die Heartbeat-Nachricht mit Zufallswert
                 heartbeat_msg = HEARTBEAT_PREFIX + random_bytes
                 
-                # Sende den Heartbeat mit Zufallswert
-                await self._send_queue.put(heartbeat_msg)
+                # Sende den Heartbeat mit Zufallswert über ZeroMQ
+                await self._zmq_send_socket.send(heartbeat_msg)
                 logger.debug(f"Sent heartbeat to remote peer (with {len(random_bytes)} random bytes)")
                 
                 # Wait for the next heartbeat interval
@@ -509,6 +603,7 @@ class UDPManager:
                 logger.error(f"Error in connection monitor: {e}")
                 await asyncio.sleep(1)  # Longer sleep on error
 
+    @staticmethod
     async def get_public_ip() -> str:
         """
         Ermittelt die öffentliche IP-Adresse des Servers.
