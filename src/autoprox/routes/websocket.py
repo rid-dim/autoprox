@@ -7,6 +7,7 @@ import uuid
 from ..utils.udp_manager import UDPManager, ConnectionStatus, HEARTBEAT_PREFIX
 import os
 from ..utils.network import get_public_ip
+import base64
 
 # Create a router for websocket endpoints
 router = APIRouter(prefix="/v0", tags=["websocket"])
@@ -161,30 +162,60 @@ async def forward_udp_to_websocket(websocket: WebSocket, udp_manager: UDPManager
             # Ignoriere Heartbeat-Nachrichten - nicht an WebSocket senden
             if data.startswith(HEARTBEAT_PREFIX):
                 continue
+            
+            try:
+                # Versuche die Daten als UTF-8 zu dekodieren (für Text-Nachrichten)
+                text_data = data.decode('utf-8', errors='strict')
                 
-            # Sende nur reguläre Daten an die WebSocket-Verbindung
-            await websocket.send_json({
-                "type": "data",
-                "data": data.decode('utf-8', errors='replace')  # Assume UTF-8 text data
-            })
+                # Sende als JSON, wenn es sich um Text handelt
+                await websocket.send_json({
+                    "type": "data",
+                    "format": "text",
+                    "data": text_data
+                })
+            except UnicodeDecodeError:
+                # Wenn es keine gültige UTF-8-Daten sind, sende als Base64-kodierte binäre Daten
+                binary_data = base64.b64encode(data).decode('ascii')
+                
+                await websocket.send_json({
+                    "type": "data",
+                    "format": "binary",
+                    "data": binary_data
+                })
 
 async def forward_websocket_to_udp(websocket: WebSocket, udp_manager: UDPManager):
     """Forward data received from WebSocket to UDP"""
     while True:
-        message = await websocket.receive_text()
         try:
-            # Parse the message to handle both text and commands
-            data = json.loads(message)
+            # Verwende receive_json für strukturierte Nachrichten
+            message = await websocket.receive_json()
             
-            if data.get("type") == "data":
-                # Send data to UDP
-                await udp_manager.send(data.get("data").encode('utf-8'))
-            elif data.get("type") == "command":
+            if message.get("type") == "data":
+                data_format = message.get("format", "text")
+                data_content = message.get("data", "")
+                
+                if data_format == "binary":
+                    # Dekodiere Base64-Daten
+                    binary_data = base64.b64decode(data_content)
+                    await udp_manager.send(binary_data)
+                else:
+                    # Text-Daten
+                    await udp_manager.send(data_content.encode('utf-8'))
+                    
+            elif message.get("type") == "command":
                 # Handle commands (future extension)
                 pass
+                
         except json.JSONDecodeError:
-            # If not JSON, treat as raw data
-            await udp_manager.send(message.encode('utf-8'))
+            # Falls keine gültige JSON-Nachricht, versuche als Roh-Text zu behandeln
+            try:
+                raw_message = await websocket.receive_text()
+                await udp_manager.send(raw_message.encode('utf-8'))
+            except Exception as e:
+                logger.error(f"Fehler beim Verarbeiten der WebSocket-Nachricht: {e}")
+        except Exception as e:
+            logger.error(f"Fehler in der WebSocket-zu-UDP-Weiterleitung: {e}")
+            await asyncio.sleep(0.1)  # Vermeide enge Schleife bei Fehlern
 
 async def send_status_updates(websocket: WebSocket, udp_manager: UDPManager, connection_id: str):
     """Send periodic status updates to the WebSocket client"""

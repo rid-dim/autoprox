@@ -5,8 +5,9 @@ import logging
 import ipaddress
 import secrets
 import struct
+import zlib
 from enum import Enum
-from typing import Optional, Tuple, Union, Dict, Any, List
+from typing import Optional, Tuple, Union, Dict, Any, List, Set
 from ..utils.encryption import encrypt_data, decrypt_data
 from datetime import datetime
 import os
@@ -29,6 +30,14 @@ HEARTBEAT_PREFIX = b"HEARTBEAT:"  # Prefix für Heartbeat-Nachrichten
 HEARTBEAT_INTERVAL = 1.0  # seconds
 # How long to wait before considering connection lost
 HEARTBEAT_TIMEOUT = 5.0  # seconds
+# Maximum UDP packet size (bytes) - safe limit to avoid fragmentation
+MAX_UDP_PACKET_SIZE = 1400  # Conservative estimate for most networks
+# Fragment message prefix
+FRAGMENT_PREFIX = b"FRAGMENT:"
+# Fragment header size (bytes): 4 (msg_id) + 4 (total_fragments) + 4 (fragment_index) + 4 (payload_size)
+FRAGMENT_HEADER_SIZE = 16
+# Maximum payload size per fragment
+MAX_FRAGMENT_PAYLOAD_SIZE = MAX_UDP_PACKET_SIZE - len(FRAGMENT_PREFIX) - FRAGMENT_HEADER_SIZE
 
 class UDPManager:
     """
@@ -41,7 +50,7 @@ class UDPManager:
         remote_host: str, 
         remote_port: int, 
         encryption_key: str,
-        local_port: int = int(os.environ.get('AUTOPROX_UDP_PORT'))  # Use environment variable
+        local_port: int = int(os.environ.get('AUTOPROX_UDP_PORT', 17171))  # Use environment variable or default
     ):
         self.remote_host = remote_host
         self.remote_port = remote_port
@@ -67,6 +76,12 @@ class UDPManager:
         
         # Timestamp of last error message
         self._last_error_timestamp = 0
+        
+        # Fragment handling
+        self._next_message_id = 0
+        self._fragment_buffer = {}  # Store received fragments: {msg_id: {fragment_index: data, ...}, ...}
+        self._completed_messages = {}  # Store completed messages: {msg_id: (completed, total_fragments)}
+        self._fragment_cleanup_task = None
     
     async def start(self):
         """Start the UDP manager and establish connection"""
@@ -103,7 +118,8 @@ class UDPManager:
             asyncio.create_task(self._udp_receive_loop()),
             asyncio.create_task(self._udp_send_loop()),
             asyncio.create_task(self._heartbeat_loop()),
-            asyncio.create_task(self._connection_monitor())
+            asyncio.create_task(self._connection_monitor()),
+            asyncio.create_task(self._fragment_cleanup_loop())
         ]
     
     async def stop(self):
@@ -129,14 +145,57 @@ class UDPManager:
         logger.info("UDP manager stopped")
     
     async def send(self, data: bytes):
-        """Send data to the remote peer"""
+        """
+        Send data to the remote peer.
+        Large messages will be automatically fragmented.
+        """
         if not self._running:
             raise RuntimeError("UDP manager is not running")
         
-        await self._send_queue.put(data)
+        if len(data) <= MAX_UDP_PACKET_SIZE:
+            # Small message, send directly
+            await self._send_queue.put(data)
+        else:
+            # Large message, needs fragmentation
+            await self._send_fragmented(data)
+    
+    async def _send_fragmented(self, data: bytes):
+        """
+        Fragment and send a large message.
+        
+        Format:
+        FRAGMENT_PREFIX + msg_id(4) + total_fragments(4) + fragment_index(4) + payload_size(4) + payload
+        """
+        # Generate message ID and increment counter
+        msg_id = self._next_message_id
+        self._next_message_id = (self._next_message_id + 1) % 0xFFFFFFFF
+        
+        # Calculate total fragments needed
+        total_fragments = (len(data) + MAX_FRAGMENT_PAYLOAD_SIZE - 1) // MAX_FRAGMENT_PAYLOAD_SIZE
+        
+        # Split data into fragments
+        for i in range(total_fragments):
+            start_pos = i * MAX_FRAGMENT_PAYLOAD_SIZE
+            end_pos = min(start_pos + MAX_FRAGMENT_PAYLOAD_SIZE, len(data))
+            payload = data[start_pos:end_pos]
+            payload_size = len(payload)
+            
+            # Create header
+            header = struct.pack("!IIII", msg_id, total_fragments, i, payload_size)
+            
+            # Create fragment
+            fragment = FRAGMENT_PREFIX + header + payload
+            
+            # Send fragment
+            await self._send_queue.put(fragment)
+            
+        logger.debug(f"Fragmented message {msg_id} into {total_fragments} parts")
     
     async def receive(self) -> Optional[bytes]:
-        """Receive data from the remote peer"""
+        """
+        Receive data from the remote peer.
+        Fragmented messages will be reassembled automatically.
+        """
         if not self._running:
             return None
         
@@ -145,6 +204,96 @@ class UDPManager:
     def get_status(self) -> ConnectionStatus:
         """Get the current connection status"""
         return self._status
+    
+    async def _process_fragments(self, fragment: bytes) -> Optional[bytes]:
+        """
+        Process a received fragment and reassemble complete messages.
+        Returns the reassembled message if complete, None otherwise.
+        """
+        # Strip prefix
+        fragment_data = fragment[len(FRAGMENT_PREFIX):]
+        
+        # Parse header
+        if len(fragment_data) < FRAGMENT_HEADER_SIZE:
+            logger.warning(f"Received fragment with invalid header size: {len(fragment_data)}")
+            return None
+        
+        header = fragment_data[:FRAGMENT_HEADER_SIZE]
+        payload = fragment_data[FRAGMENT_HEADER_SIZE:]
+        
+        try:
+            msg_id, total_fragments, fragment_index, payload_size = struct.unpack("!IIII", header)
+        except struct.error:
+            logger.warning("Failed to unpack fragment header")
+            return None
+        
+        # Validate payload size
+        if len(payload) != payload_size:
+            logger.warning(f"Fragment payload size mismatch: expected {payload_size}, got {len(payload)}")
+            return None
+        
+        # Check if message is already completed
+        if msg_id in self._completed_messages:
+            # We already processed this message, ignore this fragment
+            return None
+        
+        # Store fragment
+        if msg_id not in self._fragment_buffer:
+            self._fragment_buffer[msg_id] = {}
+        
+        self._fragment_buffer[msg_id][fragment_index] = payload
+        
+        # Check if we have all fragments
+        if len(self._fragment_buffer[msg_id]) == total_fragments:
+            # Reassemble message
+            reassembled = bytearray()
+            for i in range(total_fragments):
+                if i not in self._fragment_buffer[msg_id]:
+                    logger.warning(f"Missing fragment {i} for message {msg_id}")
+                    return None
+                reassembled.extend(self._fragment_buffer[msg_id][i])
+            
+            # Mark message as completed
+            self._completed_messages[msg_id] = (time.time(), total_fragments)
+            
+            # Clean up fragments
+            del self._fragment_buffer[msg_id]
+            
+            logger.debug(f"Reassembled message {msg_id} from {total_fragments} fragments")
+            return bytes(reassembled)
+        
+        return None
+    
+    async def _fragment_cleanup_loop(self):
+        """
+        Periodically clean up old completed messages and partial fragments.
+        """
+        while self._running:
+            try:
+                current_time = time.time()
+                
+                # Clean up completed messages older than 60 seconds
+                for msg_id in list(self._completed_messages.keys()):
+                    timestamp, _ = self._completed_messages[msg_id]
+                    if current_time - timestamp > 60:
+                        del self._completed_messages[msg_id]
+                
+                # Clean up incomplete fragments older than 30 seconds
+                # This is a basic timeout mechanism to prevent memory leaks
+                for msg_id in list(self._fragment_buffer.keys()):
+                    # Check if any fragments exist for over 30 seconds
+                    # This is a simple implementation; could be improved with per-fragment timestamps
+                    if msg_id not in self._completed_messages and len(self._fragment_buffer[msg_id]) > 0:
+                        del self._fragment_buffer[msg_id]
+                        logger.debug(f"Cleaned up incomplete fragments for message {msg_id}")
+                
+                await asyncio.sleep(10)  # Run cleanup every 10 seconds
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in fragment cleanup loop: {e}")
+                await asyncio.sleep(10)
     
     async def _udp_receive_loop(self):
         """Background task for receiving UDP packets"""
@@ -165,7 +314,7 @@ class UDPManager:
                 try:
                     decrypted_data = decrypt_data(self.encryption_key, data)
                     
-                    # Check if it's a heartbeat (now with prefix)
+                    # Check if it's a heartbeat
                     if decrypted_data.startswith(HEARTBEAT_PREFIX):
                         logger.debug("Received heartbeat from remote peer")
                         self._last_heartbeat_received = time.time()
@@ -174,9 +323,19 @@ class UDPManager:
                         if self._status == ConnectionStatus.UDP_WAITING:
                             self._status = ConnectionStatus.UDP_ESTABLISHED
                             logger.info("UDP connection established with remote peer")
+                    
+                    # Check if it's a fragment
+                    elif decrypted_data.startswith(FRAGMENT_PREFIX):
+                        # Process fragment
+                        reassembled = await self._process_fragments(decrypted_data)
+                        if reassembled:
+                            # Have a complete message, put it in the receive queue
+                            await self._receive_queue.put(reassembled)
+                    
                     else:
-                        # Put regular data in the receive queue
+                        # Regular data, put in receive queue
                         await self._receive_queue.put(decrypted_data)
+                        
                 except Exception as e:
                     logger.error(f"Error decrypting received data: {e}")
             
@@ -199,6 +358,12 @@ class UDPManager:
                 
                 # Encrypt the data
                 encrypted_data = encrypt_data(self.encryption_key, data)
+                
+                # Check size before sending
+                if len(encrypted_data) > MAX_UDP_PACKET_SIZE:
+                    logger.warning(f"Encrypted data too large: {len(encrypted_data)} bytes. This should not happen " +
+                                  "as large messages should be fragmented before encryption.")
+                    continue
                 
                 # Send it
                 peer_addr = (self.remote_host, self.remote_port)
