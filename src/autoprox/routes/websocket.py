@@ -3,14 +3,15 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, Query, De
 from pydantic import BaseModel, Field
 import json
 import asyncio
-from ..utils.udp_manager import UDPManager, ConnectionStatus
+import uuid
+from ..utils.udp_manager import UDPManager, ConnectionStatus, HEARTBEAT_PREFIX
 import os
-from ..utils.network import get_public_connection_info
+from ..utils.network import get_public_ip
 
 # Create a router for websocket endpoints
 router = APIRouter(prefix="/v0", tags=["websocket"])
 
-# Dictionary to store active UDP connections by token
+# Dictionary to store active UDP connections by connection ID
 active_connections: Dict[str, UDPManager] = {}
 
 class WebSocketInfo(BaseModel):
@@ -26,30 +27,62 @@ async def get_websocket_info():
     Returns information about the WebSocket-UDP proxy endpoint.
     This is a helper endpoint since WebSockets cannot be documented in Swagger.
     """
+    # Hole den UDP-Port aus der Umgebungsvariable
+    udp_port = int(os.environ.get('AUTOPROX_UDP_PORT', 17171))
     
-    # Ermittle die öffentliche IP per get_public_connection_info
-    connection_info = await get_public_connection_info()
+    # Ermittle die öffentliche IP
+    public_ip = await get_public_ip()
     
     # Erstelle die UDP-Verbindungs-URL
-    udp_connection_url = f"udp://{connection_info['public_ip']}:{connection_info['port']}"
+    udp_connection_url = f"udp://{public_ip}:{udp_port}"
+    
+    # Protokolldokumentation
+    protocol_docs = """
+WebSocket Nachrichten vom Server:
+- {"type": "status", "status": "STATUS_TEXT", "connection_id": "ID", "message": "TEXT"} - Statusänderungen
+- {"type": "data", "data": "DATA"} - Daten vom UDP-Peer (Heartbeats werden gefiltert)
+- {"type": "error", "connection_id": "ID", "message": "TEXT"} - Fehlermeldungen
+
+WebSocket Nachrichten vom Client:
+- {"type": "data", "data": "DATA"} - Daten zum UDP-Peer senden
+- {"type": "command", ...} - Künftige Befehlserweiterungen
+    """
     
     return {
         "websocket_url": "/v0/ws/proxy",
         "parameters": {
             "remote_host": "Target IP address (required)",
             "remote_port": "Target port (required)",
-            "encryption_key": "Encryption key (required)"
+            "encryption_key": "Encryption key (required)",
+            "client_id": "Optional client ID for multiple connections"
         },
         "udp_connection_info": udp_connection_url,
-        "documentation": "See README-websocket-udp.md for details"
+        "documentation": protocol_docs
     }
+
+@router.get("/ws/connections", response_model=List[dict])
+async def get_connections():
+    """
+    Zeigt aktive WebSocket-UDP-Verbindungen.
+    Nur zu Debug- und Testzwecken.
+    """
+    connections = []
+    for connection_id, manager in active_connections.items():
+        connections.append({
+            "connection_id": connection_id,
+            "remote_host": manager.remote_host,
+            "remote_port": manager.remote_port,
+            "status": manager.get_status().value
+        })
+    return connections
 
 @router.websocket("/ws/proxy")
 async def websocket_proxy(
     websocket: WebSocket,
     remote_host: str = Query(..., description="Remote host IP address"),
     remote_port: int = Query(..., description="Remote host port"),
-    encryption_key: str = Query(..., description="Encryption key for UDP communication")
+    encryption_key: str = Query(..., description="Encryption key for UDP communication"),
+    client_id: Optional[str] = Query(None, description="Optional client ID for multiple connections")
 ):
     """
     WebSocket endpoint that acts as a proxy to a UDP hole-punching connection.
@@ -59,8 +92,14 @@ async def websocket_proxy(
     
     The UDP connection uses hole-punching to establish a connection through NATs.
     All UDP data is encrypted using the provided encryption key.
+    
+    Multiple clients can connect to the same remote host with different encryption keys.
     """
     await websocket.accept()
+    
+    # Generiere eine eindeutige Verbindungs-ID
+    # Wenn client_id angegeben wurde, füge sie zur Verbindungs-ID hinzu
+    connection_id = f"{client_id or uuid.uuid4().hex}_{remote_host}_{remote_port}"
     
     # Create UDP manager for this connection
     udp_manager = UDPManager(
@@ -70,7 +109,6 @@ async def websocket_proxy(
     )
     
     # Store the connection
-    connection_id = f"{remote_host}_{remote_port}"
     active_connections[connection_id] = udp_manager
     
     try:
@@ -78,6 +116,7 @@ async def websocket_proxy(
         await websocket.send_json({
             "type": "status",
             "status": "CONNECTED",
+            "connection_id": connection_id,
             "message": "WebSocket connection established"
         })
         
@@ -87,7 +126,7 @@ async def websocket_proxy(
         # Start background tasks
         udp_to_ws_task = asyncio.create_task(forward_udp_to_websocket(websocket, udp_manager))
         ws_to_udp_task = asyncio.create_task(forward_websocket_to_udp(websocket, udp_manager))
-        status_update_task = asyncio.create_task(send_status_updates(websocket, udp_manager))
+        status_update_task = asyncio.create_task(send_status_updates(websocket, udp_manager, connection_id))
         
         # Wait for any task to complete (usually when the WebSocket disconnects)
         await asyncio.wait(
@@ -103,6 +142,7 @@ async def websocket_proxy(
         try:
             await websocket.send_json({
                 "type": "error",
+                "connection_id": connection_id,
                 "message": f"Error in websocket connection: {str(e)}"
             })
         except:
@@ -118,7 +158,11 @@ async def forward_udp_to_websocket(websocket: WebSocket, udp_manager: UDPManager
     while True:
         data = await udp_manager.receive()
         if data:
-            # Send the data received from UDP to the WebSocket
+            # Ignoriere Heartbeat-Nachrichten - nicht an WebSocket senden
+            if data.startswith(HEARTBEAT_PREFIX):
+                continue
+                
+            # Sende nur reguläre Daten an die WebSocket-Verbindung
             await websocket.send_json({
                 "type": "data",
                 "data": data.decode('utf-8', errors='replace')  # Assume UTF-8 text data
@@ -142,7 +186,7 @@ async def forward_websocket_to_udp(websocket: WebSocket, udp_manager: UDPManager
             # If not JSON, treat as raw data
             await udp_manager.send(message.encode('utf-8'))
 
-async def send_status_updates(websocket: WebSocket, udp_manager: UDPManager):
+async def send_status_updates(websocket: WebSocket, udp_manager: UDPManager, connection_id: str):
     """Send periodic status updates to the WebSocket client"""
     last_status = None
     
@@ -154,6 +198,7 @@ async def send_status_updates(websocket: WebSocket, udp_manager: UDPManager):
             status_message = {
                 "type": "status",
                 "status": current_status.value,
+                "connection_id": connection_id,
                 "message": get_status_message(current_status)
             }
             await websocket.send_json(status_message)

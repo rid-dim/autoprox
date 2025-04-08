@@ -3,6 +3,8 @@ import socket
 import time
 import logging
 import ipaddress
+import secrets
+import struct
 from enum import Enum
 from typing import Optional, Tuple, Union, Dict, Any, List
 from ..utils.encryption import encrypt_data, decrypt_data
@@ -21,8 +23,8 @@ class ConnectionStatus(Enum):
     UDP_ESTABLISHED = "UDP_ESTABLISHED"  # UDP connection established
     ERROR = "ERROR"  # Error state
 
-# Heartbeat message constant
-HEARTBEAT_MESSAGE = b"HEARTBEAT"
+# Heartbeat message prefix
+HEARTBEAT_PREFIX = b"HEARTBEAT:"  # Prefix für Heartbeat-Nachrichten
 # How often to send heartbeats
 HEARTBEAT_INTERVAL = 1.0  # seconds
 # How long to wait before considering connection lost
@@ -163,8 +165,8 @@ class UDPManager:
                 try:
                     decrypted_data = decrypt_data(self.encryption_key, data)
                     
-                    # Check if it's a heartbeat
-                    if decrypted_data == HEARTBEAT_MESSAGE:
+                    # Check if it's a heartbeat (now with prefix)
+                    if decrypted_data.startswith(HEARTBEAT_PREFIX):
                         logger.debug("Received heartbeat from remote peer")
                         self._last_heartbeat_received = time.time()
                         
@@ -213,9 +215,16 @@ class UDPManager:
         """Background task for sending heartbeats to keep the connection alive"""
         while self._running:
             try:
-                # Send a heartbeat to the remote peer
-                await self._send_queue.put(HEARTBEAT_MESSAGE)
-                logger.debug("Sent heartbeat to remote peer")
+                # Generiere einen Zufallswert für den Heartbeat
+                # 8 Bytes Zufallsdaten (64 Bit)
+                random_bytes = secrets.token_bytes(8)
+                
+                # Erstelle die Heartbeat-Nachricht mit Zufallswert
+                heartbeat_msg = HEARTBEAT_PREFIX + random_bytes
+                
+                # Sende den Heartbeat mit Zufallswert
+                await self._send_queue.put(heartbeat_msg)
+                logger.debug(f"Sent heartbeat to remote peer (with {len(random_bytes)} random bytes)")
                 
                 # Wait for the next heartbeat interval
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -248,7 +257,7 @@ class UDPManager:
                 break
             except Exception as e:
                 logger.error(f"Error in connection monitor: {e}")
-                await asyncio.sleep(1)  # Longer sleep on error 
+                await asyncio.sleep(1)  # Longer sleep on error
 
     async def get_public_ip() -> str:
         """
