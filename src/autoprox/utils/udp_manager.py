@@ -219,13 +219,13 @@ class UDPManager:
             fragment = FRAGMENT_PREFIX + header + payload
             
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            logger.info(f"{timestamp} - Starting to send fragment {i+1}/{total_fragments} for message {msg_id} with size {payload_size} bytes")
+            logger.debug(f"{timestamp} - Starting to send fragment {i+1}/{total_fragments} for message {msg_id} with size {payload_size} bytes")
             
             # Send fragment via ZeroMQ
             await self._zmq_send_socket.send(fragment)
             
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            logger.info(f"{timestamp} - Completed sending fragment {i+1}/{total_fragments} for message {msg_id}")
+            logger.debug(f"{timestamp} - Completed sending fragment {i+1}/{total_fragments} for message {msg_id}")
             
         logger.info(f"All fragments for message {msg_id} have been sent to UDP worker")
     
@@ -307,13 +307,13 @@ class UDPManager:
             logger.info(f"Started receiving new fragmented message {msg_id} with {total_fragments} fragments")
         
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        logger.info(f"{timestamp} - Received fragment {fragment_index+1}/{total_fragments} for message {msg_id} with size {payload_size} bytes")
+        logger.debug(f"{timestamp} - Received fragment {fragment_index+1}/{total_fragments} for message {msg_id} with size {payload_size} bytes")
         self._fragment_buffer[msg_id][fragment_index] = payload
         
         # Check if we have all fragments
         if len(self._fragment_buffer[msg_id]) == total_fragments:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            logger.info(f"{timestamp} - All fragments received for message {msg_id}, starting reassembly")
+            logger.debug(f"{timestamp} - All fragments received for message {msg_id}, starting reassembly")
             
             # Reassemble message
             reassembled = bytearray()
@@ -400,7 +400,7 @@ class UDPManager:
                     
                     # Sammle Fragmente
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    logger.info(f"{timestamp} - Received emergency encrypted fragment #{len(encrypted_fragments[addr_key])+1} with size {len(data)} bytes from {addr_key}")
+                    logger.debug(f"{timestamp} - Received emergency encrypted fragment #{len(encrypted_fragments[addr_key])+1} with size {len(data)} bytes from {addr_key}")
                     encrypted_fragments[addr_key].append(data)
                     last_fragment_time[addr_key] = current_time
                     
@@ -412,7 +412,7 @@ class UDPManager:
                         try:
                             combined_data = b''.join(encrypted_fragments[addr_key])
                             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                            logger.info(f"{timestamp} - Attempting to reassemble and decrypt {len(encrypted_fragments[addr_key])} emergency fragments with total size {len(combined_data)} bytes")
+                            logger.debug(f"{timestamp} - Attempting to reassemble and decrypt {len(encrypted_fragments[addr_key])} emergency fragments with total size {len(combined_data)} bytes")
                             
                             decrypted_data = decrypt_data(self.encryption_key, combined_data)
                             
@@ -515,13 +515,13 @@ class UDPManager:
                     
                     for i, chunk in enumerate(chunks):
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                        logger.info(f"{timestamp} - Starting to send emergency chunk {i+1}/{len(chunks)} with size {len(chunk)} bytes")
+                        logger.debug(f"{timestamp} - Starting to send emergency chunk {i+1}/{len(chunks)} with size {len(chunk)} bytes")
                         
                         peer_addr = (self.remote_host, self.remote_port)
                         self._socket.sendto(chunk, peer_addr)
                         
                         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                        logger.info(f"{timestamp} - Completed sending emergency chunk {i+1}/{len(chunks)}")
+                        logger.debug(f"{timestamp} - Completed sending emergency chunk {i+1}/{len(chunks)}")
                         
                         # Überprüfe, ob ein Heartbeat gesendet werden sollte (alle HEARTBEAT_INTERVAL Sekunden)
                         current_time = time.time()
