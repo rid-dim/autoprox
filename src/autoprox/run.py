@@ -18,8 +18,7 @@ def print_server_info(host, port, udp_port):
         f"HTTP Server: {host}:{port}",
         f"UDP Kommunikationsport: {udp_port}",
         f"API Dokumentation: http://{host}:{port}/v0/docs",
-        f"WebSocket Endpunkt (traditionell): ws://{host}:{port}/v0/ws/proxy",
-        f"WebSocket Endpunkt (SRMUDP): ws://{host}:{port}/v0/ws/srmudp/proxy",
+        f"WebSocket Endpunkt: ws://{host}:{port}/v0/ws/proxy",
         "="*60
     ]
     

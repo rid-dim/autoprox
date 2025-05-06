@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routes import data, auth, health, websocket, srmudp_websocket
+from .routes import data, auth, health, websocket
 from .utils.client import lifespan
 
 def create_app() -> FastAPI:
@@ -25,7 +25,7 @@ def create_app() -> FastAPI:
         allow_origins=["*"],  # Erlaubt alle Ursprünge
         allow_credentials=True,
         allow_methods=["*"],  # Erlaubt alle Methoden
-        allow_headers=["*"],  # Erlaubt alle Header
+        allow_headers=["*"]   # Erlaubt alle Header
     )
 
     @app.get("/ant-proxy-id")
@@ -36,12 +36,11 @@ def create_app() -> FastAPI:
         """
         return "autoprox-0"
 
-    # Include all routers
+    # Include routers
+    app.include_router(health.router)
     app.include_router(data.router)
     app.include_router(auth.router)
-    app.include_router(health.router)
     app.include_router(websocket.router)
-    app.include_router(srmudp_websocket.router)
     
     return app
 
