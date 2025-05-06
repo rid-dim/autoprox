@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routes import data, auth, health, websocket
+from .routes import data, auth, health, websocket, srmudp_websocket
 from .utils.client import lifespan
 
 def create_app() -> FastAPI:
@@ -41,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(health.router)
     app.include_router(websocket.router)
+    app.include_router(srmudp_websocket.router)
     
     return app
 

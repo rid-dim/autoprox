@@ -8,7 +8,7 @@ license = "MIT"
 packages = [{include = "autoprox", from = "src"}]
 
 [tool.poetry.dependencies]
-python = ">=3.11"
+python = ">=3.11,<4.0"
 autonomi-client = "==0.4.1"
 fastapi = ">=0.110.0"
 uvicorn = ">=0.27.1"
@@ -17,6 +17,7 @@ cryptography = ">=42.0.0"
 websockets = ">=12.0"
 pyzmq = ">=26.4"
 aiohttp = "^3.11.18"
+srmudp = "^0.0.2"
 
 [tool.poetry.group.dev.dependencies]
 black = ">=24.2.0"
