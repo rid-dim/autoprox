@@ -1,108 +1,239 @@
-# Simple HTTP Proxy for Autonomy Network
+# WebSocket-SRMUDP Bridge
 
-## IMPORTANT SECURITY NOTICE!!!!!
+A simple bridge server that connects WebSocket clients to SRMUDP (Secure Reliable Message UDP) peers. This allows web applications to communicate with SRMUDP-based systems through a WebSocket interface.
 
-Using this HTTP proxy will completely undermine your browser's Cross Site Scripting security measures. Only access sites or applications on the Autonomi Network that you trust, and preferably use Immutable Data Addresses instead of pointers or names, especially when dealing with applications that may handle tokens.
+## Features
 
-While Immutable Data can generally be considered trustworthy if the source is reliable, it is important to note that such data or programs may still interact with pointers to other content that could change at any time.
+- **WebSocket to SRMUDP Bridge**: Direct bidirectional communication bridge
+- **Simple Hook System**: Incoming SRMUDP messages are forwarded directly to WebSocket via hook functions
+- **Multiple Formats**: Supports both text and binary message formats
+- **Heartbeat Filtering**: Automatically filters out common heartbeat/ping messages
+- **Public IP Discovery**: Built-in STUN client for discovering external IP addresses
+- **NAT Traversal Support**: Essential information for SRMUDP hole-punching
+- **Easy Integration**: Simple WebSocket API that any web application can use
 
-This tool is provided without any warranties, and you use it at your own risk. The Autonomi Network offers significant capabilities, but with that power comes substantial risks. Exercise extreme caution regarding the sites and applications you choose to visit.
+## Installation
 
-
-## Overview
-This Python package provides a simple HTTP proxy server to access the Autonomi Network. 
-
-Currently the only supported Data Type is chunks/files.
-
-TODO:
-- Pointer
-- Scratchpad
-- GraphEntry
-- Register
-- Graph (?)
-
-### Goals
-
-The Idea is to create a simple FastAPI server that wraps all basic operations for Datatypes into a simple REST API that can be installed via pip and doesn't require docker/rust to be installed on the system. An easy entry into the Autonomi Network.
-
-### Design
-
-Simple Fastapi server served via Uvicorn that comes with a nice Swagger doc website and an OpenAPI interface description.
-In the Server it just wraps the autonomi-client functionality.
-
-To not send a Private Key across the wire repeatedly the proxy does have a route to either import a specified Private Key or set up a wallet on its own and returns an access token as answer. DO NOT LOOSE THAT ACCESS Token!!! the private key/wallet is stored AES encrypted and token on it are lost if you loose that Token (that is used as symmetric key to access the private key for all put operations)
-
-I Repeat (!) when using the PUT-capabilities you need to handle the Token with care! If you loose it (and didn't import a Private Key you still have a backup from) your token are lost!
-
-
-### Operations
-
-GET:
-- getting Data public/private - no payment required
-
-PUT:
-- uploading/updating data (pointer, scratchpad, chunks/files)
-
-
-since the current version only implements immutable data there will just be 1 GET and 1 PUT route for them as well as 1 additional PUT route to import/generate a PrivateKey. 
-
-endpoint of the server:
-
-http://localhost:17017/v0/docs
-
-
-## Installation and Usage
-
-### Installation
-
-You can install autoprox directly from PyPI:
+### Using Poetry (recommended)
 
 ```bash
-pip install autoprox
+poetry install
 ```
 
-Or with uv:
+### Using pip
 
 ```bash
-uv pip install autoprox
+pip install -e .
 ```
 
-### Usage
+## Usage
 
-After installation, you can start the proxy server by running:
+### Starting the Server
 
 ```bash
+# Start with default settings (localhost:8000)
 autoprox
+
+# Start with custom host and port
+autoprox --host 0.0.0.0 --port 8080
+
+# Start with preferred SRMUDP port
+autoprox --srmudp-port 12345
+
+# Start with all custom settings
+autoprox --host 0.0.0.0 --port 8080 --srmudp-port 12345
+
+# Start with auto-reload for development
+autoprox --reload
 ```
 
-By default, the server will run on `localhost:17017`. You can customize this with command-line arguments:
+#### Command Line Options
+
+- `--host HOST`: Host to listen on (default: localhost)
+- `--port PORT`: HTTP port for the web server (default: 8000)  
+- `--srmudp-port PORT`: Preferred SRMUDP bind port (default: 0 for random)
+- `--reload`: Enable auto-reload for development
+
+### WebSocket API
+
+Connect to the WebSocket bridge endpoint:
+
+```
+ws://localhost:8000/v0/ws/bridge?remote_address=TARGET_HOST:TARGET_PORT&local_port=0
+```
+
+#### Parameters
+
+- `remote_address`: Target SRMUDP address in format `host:port` (required)
+- `local_port`: Local port to bind to (optional)
+  - `None`: Use server preference (set via `--srmudp-port`)
+  - `0`: Random port
+  - `>0`: Specific port number
+
+#### Message Format
+
+**Sending to SRMUDP:**
+```json
+{
+    "type": "message",
+    "format": "text",  // or "binary"
+    "data": "Your message here"
+}
+```
+
+**Receiving from SRMUDP:**
+```json
+{
+    "type": "message",
+    "format": "text",  // or "binary"  
+    "data": "Message from SRMUDP peer"
+}
+```
+
+**Status Messages:**
+```json
+{
+    "type": "status",
+    "status": "connected",
+    "local_address": "127.0.0.1:12345",
+    "peer_address": "127.0.0.1:54321"
+}
+```
+
+### Example
+
+See `examples/websocket_bridge_example.py` for a complete working example.
+
+```python
+import asyncio
+import json
+import websockets
+
+async def bridge_client():
+    url = "ws://localhost:8000/v0/ws/bridge?remote_address=127.0.0.1:12345"
+    
+    async with websockets.connect(url) as websocket:
+        # Send a message
+        await websocket.send(json.dumps({
+            "type": "message",
+            "format": "text",
+            "data": "Hello SRMUDP!"
+        }))
+        
+        # Receive response
+        response = await websocket.recv()
+        data = json.loads(response)
+        print(f"Received: {data}")
+
+asyncio.run(bridge_client())
+```
+
+## API Documentation
+
+When the server is running, visit:
+- API Docs: http://localhost:8000/v0/docs
+- Bridge Info: http://localhost:8000/v0/ws/info
+- Active Bridges: http://localhost:8000/v0/ws/bridges
+- Server Config: http://localhost:8000/v0/ws/server-config
+
+### Network Discovery Endpoints
+
+- **Public IP**: `GET /v0/network/public-ip` - Discover your public IP via STUN
+- **Public Address**: `GET /v0/network/public-address` - Discover your public IP and port via STUN  
+- **SRMUDP Address**: `GET /v0/network/srmudp-address` - Discover public address using actual SRMUDP socket
+- **SRMUDP Test**: `GET /v0/network/srmudp-address-test?test_port=12345` - Test STUN with specific port
+- **Active Ports**: `GET /v0/network/active-ports` - Show which ports are in use by WebSocket bridges
+- **STUN Servers**: `GET /v0/network/stun-servers` - List available STUN servers
+
+The **SRMUDP Address** endpoint is the most accurate for hole-punching as it uses the actual SRMUDP UDP socket.
+
+**Important**: The SRMUDP Address and Test endpoints will return a `409 Conflict` error if there's already an active WebSocket bridge using the same port, preventing socket conflicts.
+
+Example:
+```bash
+curl http://localhost:8000/v0/network/public-ip
+# Returns: {"public_ip": "78.51.80.235", "discovery_method": "STUN", "success": true}
+
+curl http://localhost:8000/v0/network/srmudp-address  
+# Returns: {"public_ip": "78.51.80.235", "public_port": 12345, "local_port": 12345, "discovery_method": "STUN via SRMUDP socket", "success": true}
+
+curl http://localhost:8000/v0/network/active-ports
+# Returns information about active WebSocket bridges and port conflicts
+```
+
+### WebSocket Commands
+
+The WebSocket API supports several message types:
+
+**Send Message:**
+```json
+{
+    "type": "message",
+    "format": "text",  // or "binary"
+    "data": "Your message here"
+}
+```
+
+**Discover Public Address (on active connection):**
+```json
+{
+    "type": "discover_public_address"
+}
+```
+
+**Responses:**
+```json
+{
+    "type": "public_address_discovered",
+    "public_ip": "78.51.80.235",
+    "public_port": 12345,
+    "local_address": ["127.0.0.1", 12345],
+    "peer_address": ["127.0.0.1", 54321],
+    "discovery_method": "STUN via active SRMUDP connection"
+}
+```
+
+## Architecture
+
+The bridge works by:
+
+1. **WebSocket Connection**: Client connects to `/v0/ws/bridge` endpoint
+2. **SRMUDP Connection**: Server establishes SRMUDP connection to target address
+3. **Hook Functions**: SRMUDP incoming messages are handled by a hook function that directly forwards to WebSocket
+4. **Bidirectional Forwarding**: All WebSocket messages (except heartbeats) are forwarded to SRMUDP peer
+
+## Dependencies
+
+- FastAPI: Web framework and WebSocket support
+- SRMUDP: Secure reliable UDP communication
+- Uvicorn: ASGI server
+- Pydantic: Data validation
+
+## Development
+
+### Running Tests
 
 ```bash
-autoprox --host 0.0.0.0 --port 8000
+# Install development dependencies
+poetry install --with dev
+
+# Run the example
+python examples/websocket_bridge_example.py
 ```
 
-The Swagger API documentation will be available at:
+### Code Style
 
-```
-http://localhost:17017/v0/docs
-```
+```bash
+# Format code
+black src/
 
-### Example Access
+# Lint code  
+ruff src/
 
-To access a file from the Autonomi Network:
-
-```
-http://localhost:17017/v0/data/get/public/{data_address}/{filename}
-```
-
-For example:
-
-```
-http://localhost:17017/v0/data/get/public/a7d2fdbb975efaea25b7ebe3d38be4a0b82c1d71e9b89ac4f37bc9f8677826e0/dog.png
+# Type checking
+mypy src/
 ```
 
-## Links
+## License
 
-- [Autonomi](https://autonomi.com)
-- [Autonomi Developer Documentation](https://docs.autonomi.com/developers/how-to-guides/build-apps-with-python)
-- [autonomi-client on PyPI](https://pypi.org/project/autonomi-client/)
+MIT License. See LICENSE file for details.

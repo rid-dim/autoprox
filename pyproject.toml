@@ -1,30 +1,30 @@
-[project]
+[tool.poetry]
 name = "autoprox"
-version = "0.1.1"
-description = "simple autonomi proxy server written in python"
+version = "0.2.0"
+description = "WebSocket to SRMUDP bridge server"
+authors = []
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.11"
-dependencies = [
-    "autonomi-client>=0.3.61",
-    "fastapi>=0.110.0",
-    "uvicorn>=0.27.1",
-    "pydantic>=2.6.3",
-]
+license = "MIT"
+packages = [{include = "autoprox", from = "src"}]
 
-[project.optional-dependencies]
-dev = [
-    "black>=24.2.0",
-    "mypy>=1.9.0",
-    "ruff>=0.3.0",
-]
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+fastapi = ">=0.110.0"
+uvicorn = ">=0.27.1"
+pydantic = ">=2.6.3"
+websockets = ">=12.0"
+srmudp = "^0.0.3"
+
+[tool.poetry.group.dev.dependencies]
+black = ">=24.2.0"
+mypy = ">=1.9.0"
+ruff = ">=0.3.0"
+build = ">=1.0.3"
+twine = ">=5.0.0"
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
 
-[project.scripts]
+[tool.poetry.scripts]
 autoprox = "autoprox.run:main"
-
-[tool.setuptools]
-package-dir = {"" = "src"}
