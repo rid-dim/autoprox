@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "autoprox"
-version = "0.2.0"
+version = "0.3.0"
 description = "WebSocket to SRMUDP bridge server"
 authors = []
 readme = "README.md"
