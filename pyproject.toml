@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "autoprox"
-version = "0.1.2"
-description = "simple autonomi proxy server written in python"
+version = "0.2.0"
+description = "WebSocket to SRMUDP bridge server"
 authors = []
 readme = "README.md"
 license = "MIT"
@@ -9,15 +9,11 @@ packages = [{include = "autoprox", from = "src"}]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
-autonomi-client = "==0.4.1"
 fastapi = ">=0.110.0"
 uvicorn = ">=0.27.1"
 pydantic = ">=2.6.3"
-cryptography = ">=42.0.0"
 websockets = ">=12.0"
-pyzmq = ">=26.4"
-aiohttp = "^3.11.18"
-srmudp = "^0.0.2"
+srmudp = "^0.0.3"
 
 [tool.poetry.group.dev.dependencies]
 black = ">=24.2.0"

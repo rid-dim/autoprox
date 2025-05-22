@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routes import data, auth, health, websocket
-from .utils.client import lifespan
+from .routes import health, websocket, network
 
 def create_app() -> FastAPI:
     """
@@ -11,36 +10,33 @@ def create_app() -> FastAPI:
         Configured FastAPI application
     """
     app = FastAPI(
-        title="Autonomi Network Proxy",
-        description="A simple HTTP proxy for the Autonomi Network",
-        version="0.1.0",
+        title="WebSocket-SRMUDP Bridge",
+        description="A bridge between WebSocket and SRMUDP communication with public IP discovery",
+        version="0.2.0",
         docs_url="/v0/docs",
-        openapi_url="/v0/openapi.json",
-        lifespan=lifespan
+        openapi_url="/v0/openapi.json"
     )
 
     # Allow all CORS origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Erlaubt alle Ursprünge
+        allow_origins=["*"],
         allow_credentials=True,
-        allow_methods=["*"],  # Erlaubt alle Methoden
-        allow_headers=["*"]   # Erlaubt alle Header
+        allow_methods=["*"],
+        allow_headers=["*"]
     )
 
-    @app.get("/ant-proxy-id")
-    async def get_proxy_id() -> str:
+    @app.get("/bridge-id")
+    async def get_bridge_id() -> str:
         """
-        Returns the ID of this proxy server instance.
-        This route is globally available (not under version prefixes).
+        Returns the ID of this bridge server instance.
         """
-        return "autoprox-0"
+        return "websocket-srmudp-bridge-v1"
 
     # Include routers
     app.include_router(health.router)
-    app.include_router(data.router)
-    app.include_router(auth.router)
     app.include_router(websocket.router)
+    app.include_router(network.router)
     
     return app
 

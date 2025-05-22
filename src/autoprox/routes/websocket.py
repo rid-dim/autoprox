@@ -1,291 +1,272 @@
-from typing import Annotated, Dict, Optional, List
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Header, Query, Depends
-from pydantic import BaseModel, Field
-import json
 import asyncio
-import uuid
+import json
 import logging
-from ..utils.srmudp_manager import SRMUDPManager, ConnectionStatus
-import os
 import base64
+import os
+from typing import Dict, Optional
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from pydantic import BaseModel, Field
+from ..utils.srmudp_bridge import SRMUDPBridge
 
-# Logging konfigurieren
 logger = logging.getLogger(__name__)
 
-# Create a router for websocket endpoints
+# Create router for websocket endpoints
 router = APIRouter(prefix="/v0", tags=["websocket"])
 
-# Dictionary to store active SRMUDP connections by connection ID
-active_connections: Dict[str, SRMUDPManager] = {}
+# Store active bridges by connection ID
+active_bridges: Dict[str, SRMUDPBridge] = {}
 
 class WebSocketInfo(BaseModel):
     """Model for WebSocket information response"""
     websocket_url: str = Field(..., description="URL of the WebSocket endpoint")
-    parameters: Dict[str, str] = Field(..., description="Required parameters for the WebSocket connection")
-    udp_connection_info: str = Field(..., description="UDP connection information")
-    documentation: str = Field(..., description="Reference to detailed documentation")
+    parameters: Dict[str, str] = Field(..., description="Required parameters")
+    description: str = Field(..., description="Service description")
 
 @router.get("/ws/info", response_model=WebSocketInfo)
 async def get_websocket_info():
     """
-    Returns information about the WebSocket-UDP proxy endpoint.
-    This is a helper endpoint since WebSockets cannot be documented in Swagger.
+    Returns information about the WebSocket-SRMUDP bridge endpoint.
     """
-    # Get the UDP port from the environment variable
-    udp_port = int(os.environ.get('AUTOPROX_UDP_PORT', 0))
-    
-    # Get the public IP
-    public_ip = await SRMUDPManager.get_public_ip()
-    
-    # Create the UDP connection URL
-    udp_connection_url = f"udp://{public_ip}:{udp_port}"
-    
-    # Protocol documentation
-    protocol_docs = """
-WebSocket Nachrichten vom Server:
-- {"type": "status", "status": "STATUS_TEXT", "connection_id": "ID", "message": "TEXT"} - Statusänderungen
-- {"type": "data", "data": "DATA"} - Daten vom UDP-Peer
-- {"type": "error", "connection_id": "ID", "message": "TEXT"} - Fehlermeldungen
-
-WebSocket Nachrichten vom Client:
-- {"type": "data", "data": "DATA"} - Daten zum UDP-Peer senden
-- {"type": "command", ...} - Künftige Befehlserweiterungen
-    """
+    default_srmudp_port = int(os.environ.get('AUTOPROX_SRMUDP_PORT', 0))
+    port_description = f"Local port to bind to (optional, default: server preference {default_srmudp_port}, 0 for random)"
     
     return {
-        "websocket_url": "/v0/ws/proxy",
+        "websocket_url": "/v0/ws/bridge",
         "parameters": {
-            "remote_host": "Target IP address (required)",
-            "remote_port": "Target port (required)",
-            "encryption_key": "Encryption key (required)",
-            "client_id": "Optional client ID for multiple connections"
+            "remote_address": "Target address in format 'host:port' (required)",
+            "local_port": port_description
         },
-        "udp_connection_info": udp_connection_url,
-        "documentation": protocol_docs
+        "description": "WebSocket to SRMUDP bridge - forwards all non-heartbeat messages bidirectionally"
     }
 
-@router.get("/ws/connections", response_model=List[dict])
-async def get_connections():
-    """
-    Zeigt aktive WebSocket-UDP-Verbindungen.
-    Nur zu Debug- und Testzwecken.
-    """
-    connections = []
-    for connection_id, manager in active_connections.items():
-        connections.append({
-            "connection_id": connection_id,
-            "remote_host": manager.remote_host,
-            "remote_port": manager.remote_port,
-            "status": manager.get_status().value
-        })
-    return connections
-
-@router.websocket("/ws/proxy")
-async def websocket_proxy(
+@router.websocket("/ws/bridge")
+async def websocket_srmudp_bridge(
     websocket: WebSocket,
-    remote_host: str = Query(..., description="Remote host IP address"),
-    remote_port: int = Query(..., description="Remote host port"),
-    encryption_key: str = Query(..., description="Encryption key for UDP communication"),
-    client_id: Optional[str] = Query(None, description="Optional client ID for multiple connections")
+    remote_address: str = Query(..., description="Remote address in format 'host:port'"),
+    local_port: Optional[int] = Query(None, description="Local port to bind to (None for server default, 0 for random)")
 ):
     """
-    WebSocket endpoint that acts as a proxy to a secure reliable UDP connection.
+    WebSocket to SRMUDP bridge.
     
-    The client connects to this WebSocket and specifies a remote host to connect to via UDP.
-    The server will establish a UDP connection to the remote host and proxy data between the WebSocket and UDP.
-    
-    The UDP connection uses hole-punching to establish a connection through NATs.
-    All data is encrypted using the SRMUDP library's built-in encryption.
-    
-    Multiple clients can connect to the same remote host with different encryption keys.
+    Establishes a bidirectional bridge between WebSocket and SRMUDP.
+    All messages received via WebSocket (except heartbeat) are forwarded to SRMUDP.
+    All messages received via SRMUDP are forwarded to WebSocket.
     """
     await websocket.accept()
     
-    # Generiere eine eindeutige Verbindungs-ID
-    # Wenn client_id angegeben wurde, füge sie zur Verbindungs-ID hinzu
-    connection_id = f"{client_id or uuid.uuid4().hex}_{remote_host}_{remote_port}"
+    # Use server default SRMUDP port if none specified
+    if local_port is None:
+        local_port = int(os.environ.get('AUTOPROX_SRMUDP_PORT', 0))
     
-    # Create SRMUDP manager for this connection
-    srmudp_manager = SRMUDPManager(
-        remote_host=remote_host,
-        remote_port=remote_port,
-        encryption_key=encryption_key
-    )
+    # Create connection ID for logging
+    connection_id = f"{remote_address}_{local_port}"
     
-    # Store the connection
-    active_connections[connection_id] = srmudp_manager
+    # Create SRMUDP bridge
+    bridge = SRMUDPBridge(local_port=local_port)
+    active_bridges[connection_id] = bridge
+    
+    # Set up WebSocket send hook
+    async def websocket_send_hook(data: bytes):
+        """Hook function to send data from SRMUDP to WebSocket"""
+        try:
+            # Try to decode as UTF-8 text
+            try:
+                text_data = data.decode('utf-8')
+                await websocket.send_json({
+                    "type": "message", 
+                    "format": "text",
+                    "data": text_data
+                })
+                logger.debug(f"Sent text message to WebSocket: {len(text_data)} chars")
+            except UnicodeDecodeError:
+                # Send as base64 encoded binary
+                binary_data = base64.b64encode(data).decode('ascii')
+                await websocket.send_json({
+                    "type": "message",
+                    "format": "binary", 
+                    "data": binary_data
+                })
+                logger.debug(f"Sent binary message to WebSocket: {len(data)} bytes")
+                
+        except Exception as e:
+            logger.error(f"Error sending to WebSocket: {e}")
+    
+    # Set the hook
+    bridge.set_websocket_hook(websocket_send_hook)
     
     try:
-        # Send initial status - WebSocket connected
-        await websocket.send_json({
-            "type": "status",
-            "status": "CONNECTED",
-            "connection_id": connection_id,
-            "message": "WebSocket connection established"
-        })
-        
         # Start SRMUDP connection
-        await srmudp_manager.start()
+        logger.info(f"Starting bridge to {remote_address}")
+        success = await bridge.start(remote_address)
         
-        # Start background tasks
-        udp_to_ws_task = asyncio.create_task(forward_udp_to_websocket(websocket, srmudp_manager))
-        ws_to_udp_task = asyncio.create_task(forward_websocket_to_udp(websocket, srmudp_manager))
-        status_update_task = asyncio.create_task(send_status_updates(websocket, srmudp_manager, connection_id))
-        
-        # Wait for any task to complete (usually when the WebSocket disconnects)
-        await asyncio.wait(
-            [udp_to_ws_task, ws_to_udp_task, status_update_task],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        
-    except WebSocketDisconnect:
-        # WebSocket disconnected
-        logger.info(f"WebSocket disconnected for connection {connection_id}")
-    except Exception as e:
-        # Try to send error message
-        try:
-            logger.error(f"Error in websocket connection: {str(e)}")
+        if not success:
             await websocket.send_json({
                 "type": "error",
-                "connection_id": connection_id,
-                "message": f"Error in websocket connection: {str(e)}"
+                "message": f"Failed to connect to {remote_address}"
+            })
+            return
+        
+        # Send connection success
+        await websocket.send_json({
+            "type": "status",
+            "status": "connected",
+            "local_address": bridge.get_local_address(),
+            "peer_address": bridge.get_peer_address()
+        })
+        
+        # Handle WebSocket messages
+        while bridge.is_running:
+            try:
+                # Receive message from WebSocket
+                message = await websocket.receive_text()
+                
+                # Skip heartbeat messages
+                if _is_heartbeat_message(message):
+                    logger.debug("Skipping heartbeat message")
+                    continue
+                
+                # Try to parse as JSON
+                try:
+                    message_data = json.loads(message)
+                    
+                    # Handle different message types
+                    if message_data.get("type") == "message":
+                        # Forward regular messages to SRMUDP peer
+                        format_type = message_data.get("format", "text")
+                        data = message_data.get("data", "")
+                        
+                        # Convert data to bytes based on format
+                        if format_type == "binary":
+                            try:
+                                # Decode base64 for binary data
+                                binary_data = base64.b64decode(data)
+                                await bridge.send_to_peer(binary_data)
+                            except Exception as e:
+                                logger.error(f"Failed to decode binary data: {e}")
+                                await websocket.send_text(json.dumps({
+                                    "type": "error",
+                                    "error": f"Invalid binary data format: {str(e)}"
+                                }))
+                        else:
+                            # Send as text (UTF-8 encoded)
+                            await bridge.send_to_peer(data.encode('utf-8'))
+                    
+                    elif message_data.get("type") == "discover_public_address":
+                        # Perform STUN discovery on the active connection
+                        logger.info(f"WebSocket {connection_id} requested public address discovery")
+                        
+                        try:
+                            public_address = await bridge.discover_public_address_safe()
+                            
+                            if public_address:
+                                public_ip, public_port = public_address
+                                await websocket.send_text(json.dumps({
+                                    "type": "public_address_discovered",
+                                    "public_ip": public_ip,
+                                    "public_port": public_port,
+                                    "local_address": bridge.get_local_address(),
+                                    "peer_address": bridge.get_peer_address(),
+                                    "discovery_method": "STUN via active SRMUDP connection"
+                                }))
+                            else:
+                                await websocket.send_text(json.dumps({
+                                    "type": "public_address_discovery_failed",
+                                    "error": "Failed to discover public address via STUN",
+                                    "local_address": bridge.get_local_address(),
+                                    "peer_address": bridge.get_peer_address()
+                                }))
+                                
+                        except Exception as e:
+                            logger.error(f"Error during public address discovery: {e}")
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "error": f"Public address discovery failed: {str(e)}"
+                            }))
+                    
+                    else:
+                        # Unknown message type
+                        await websocket.send_text(json.dumps({
+                            "type": "error", 
+                            "error": f"Unknown message type: {message_data.get('type')}"
+                        }))
+                    
+                except json.JSONDecodeError:
+                    # Treat as plain text
+                    text_bytes = message.encode('utf-8')
+                    await bridge.send_to_peer(text_bytes)
+                    logger.debug(f"Forwarded plain text to SRMUDP peer")
+                    
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected for {connection_id}")
+                break
+            except Exception as e:
+                logger.error(f"Error handling WebSocket message: {e}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Error in WebSocket bridge: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error", 
+                "message": str(e)
             })
         except:
             pass
     finally:
         # Clean up
-        if connection_id in active_connections:
-            del active_connections[connection_id]
-        await srmudp_manager.stop()
-        logger.info(f"Connection {connection_id} closed")
+        if connection_id in active_bridges:
+            del active_bridges[connection_id]
+        await bridge.stop()
+        logger.info(f"Bridge {connection_id} closed")
 
-async def forward_udp_to_websocket(websocket: WebSocket, srmudp_manager: SRMUDPManager):
-    """Forward data received from SRMUDP to the WebSocket"""
-    while True:
-        try:
-            data = await srmudp_manager.receive()
-            if data:
-                try:
-                    # Versuche die Daten als UTF-8 zu dekodieren (für Text-Nachrichten)
-                    text_data = data.decode('utf-8', errors='strict')
-                    
-                    # Sende als JSON, wenn es sich um Text handelt
-                    await websocket.send_json({
-                        "type": "data",
-                        "format": "text",
-                        "data": text_data
-                    })
-                    logger.debug(f"Sent text data to WebSocket: {len(text_data)} chars")
-                except UnicodeDecodeError:
-                    # Wenn es keine gültige UTF-8-Daten sind, sende als Base64-kodierte binäre Daten
-                    binary_data = base64.b64encode(data).decode('ascii')
-                    
-                    await websocket.send_json({
-                        "type": "data",
-                        "format": "binary",
-                        "data": binary_data
-                    })
-                    logger.debug(f"Sent binary data to WebSocket: {len(data)} bytes")
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected")
-            break
-        except asyncio.CancelledError:
-            logger.info("UDP to WebSocket task cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Error forwarding UDP to WebSocket: {e}")
-            await asyncio.sleep(0.1)  # Avoid tight loop on errors
-
-async def forward_websocket_to_udp(websocket: WebSocket, srmudp_manager: SRMUDPManager):
-    """Forward data received from WebSocket to SRMUDP"""
-    while True:
-        try:
-            # Verwende receive_json für strukturierte Nachrichten
-            message = await websocket.receive_json()
-            
-            if message.get("type") == "data":
-                data_format = message.get("format", "text")
-                data_content = message.get("data", "")
-                
-                if data_format == "binary":
-                    # Dekodiere Base64-Daten
-                    binary_data = base64.b64decode(data_content)
-                    await srmudp_manager.send(binary_data)
-                    logger.debug(f"Sent binary data to SRMUDP: {len(binary_data)} bytes")
-                else:
-                    # Text-Daten
-                    text_data = data_content.encode('utf-8')
-                    await srmudp_manager.send(text_data)
-                    logger.debug(f"Sent text data to SRMUDP: {len(text_data)} bytes")
-                    
-            elif message.get("type") == "command":
-                # Handle commands (future extension)
-                logger.debug(f"Received command: {message}")
-                pass
-                
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected, stopping forward_websocket_to_udp loop.")
-            break
-        except asyncio.CancelledError:
-            logger.info("WebSocket to UDP task cancelled")
-            break
-        except json.JSONDecodeError:
-            # Falls keine gültige JSON-Nachricht, versuche als Roh-Text zu behandeln
-            try:
-                raw_message = await websocket.receive_text()
-                await srmudp_manager.send(raw_message.encode('utf-8'))
-                logger.debug(f"Sent raw text data to SRMUDP: {len(raw_message)} chars")
-            except WebSocketDisconnect:
-                logger.info("WebSocket disconnected during raw message handling, stopping loop.")
-                break
-            except Exception as e:
-                logger.error(f"Fehler beim Verarbeiten der WebSocket-Nachricht: {e}")
-        except Exception as e:
-            logger.error(f"Fehler in der WebSocket-zu-SRMUDP-Weiterleitung: {e}")
-            await asyncio.sleep(0.1)  # Vermeide enge Schleife bei Fehlern
-
-async def send_status_updates(websocket: WebSocket, srmudp_manager: SRMUDPManager, connection_id: str):
-    """Send periodic status updates to the WebSocket client"""
-    last_status = None
+def _is_heartbeat_message(message: str) -> bool:
+    """
+    Check if a message is a heartbeat/ping message.
     
-    while True:
-        try:
-            current_status = srmudp_manager.get_status()
-            
-            # Only send updates when status changes
-            if current_status != last_status:
-                status_message = {
-                    "type": "status",
-                    "status": current_status.value,
-                    "connection_id": connection_id,
-                    "message": get_status_message(current_status)
-                }
-                await websocket.send_json(status_message)
-                logger.info(f"Status change for {connection_id}: {current_status.value}")
-                last_status = current_status
-            
-            await asyncio.sleep(1)  # Check status every second
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnected, stopping status updates.")
-            break
-        except asyncio.CancelledError:
-            logger.info("Status update task cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Error in status updates: {e}")
-            await asyncio.sleep(1)
+    Args:
+        message: The message to check
+        
+    Returns:
+        True if it's a heartbeat message, False otherwise
+    """
+    try:
+        data = json.loads(message)
+        msg_type = data.get("type", "").lower()
+        return msg_type in ["ping", "pong", "heartbeat", "keepalive"]
+    except:
+        # Check for common heartbeat strings
+        lower_msg = message.lower().strip()
+        return lower_msg in ["ping", "pong", "heartbeat", "keepalive"]
 
-def get_status_message(status: ConnectionStatus) -> str:
-    """Get a human-readable message for a connection status"""
-    if status == ConnectionStatus.CONNECTED:
-        return "WebSocket connection established, waiting for UDP"
-    elif status == ConnectionStatus.UDP_WAITING:
-        return "Attempting to establish UDP connection"
-    elif status == ConnectionStatus.UDP_ESTABLISHED:
-        return "UDP connection established with remote peer"
-    elif status == ConnectionStatus.RECONNECTING:
-        return "Connection lost, attempting to reconnect"
-    elif status == ConnectionStatus.ERROR:
-        return "Error in UDP connection"
-    else:
-        return "Unknown status" 
+@router.get("/ws/bridges")
+async def get_active_bridges():
+    """
+    Get information about active WebSocket-SRMUDP bridges.
+    For debugging and monitoring.
+    """
+    bridges_info = []
+    for connection_id, bridge in active_bridges.items():
+        bridges_info.append({
+            "connection_id": connection_id,
+            "local_address": bridge.get_local_address(),
+            "peer_address": bridge.get_peer_address(),
+            "is_connected": bridge.is_connected,
+            "is_running": bridge.is_running
+        })
+    return {
+        "active_bridges": len(bridges_info),
+        "bridges": bridges_info
+    }
+
+@router.get("/ws/server-config")
+async def get_server_config():
+    """
+    Get the current server configuration.
+    """
+    default_srmudp_port = int(os.environ.get('AUTOPROX_SRMUDP_PORT', 0))
+    
+    return {
+        "preferred_srmudp_port": default_srmudp_port,
+        "port_behavior": "0 = random port, >0 = preferred port",
+        "note": "Clients can override this with the local_port parameter"
+    } 
